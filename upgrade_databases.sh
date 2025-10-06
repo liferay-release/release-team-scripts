@@ -2,9 +2,10 @@
 #
 # Author: Brian Joyner Wulbern <brian.wulbern@liferay.com>
 # Platform: Linux/Unix
-# VERSION: 1.14.0
+# VERSION: 1.14.1
 # Added support for IPC and Sapphire
-#
+# patch: fixed import logic for TUDelft; increased sleep for PostgreSQL Docker up check; toggled all upgrade.database.preupgrade.* properties to 'true'
+# 
 
 export_mysql_dump() {
   local MYSQL_CONTAINER_NAME="mysql_db"
@@ -586,7 +587,7 @@ run_postgresql() {
   if [ $? -eq 0 ]; then
     echo "Waiting for PostgreSQL to be ready..."
     until docker exec postgresql_db pg_isready -U root -h localhost; do
-      sleep 1
+      sleep 10
     done
     echo "PostgreSQL container started successfully!"
   else
@@ -1296,7 +1297,7 @@ setup_and_import_mysql() {
   # Skip import if database is already populated (checked earlier)
   if [[ "$IS_DXP_CLOUD" == "true" && -n "$table_count" && "$table_count" -gt 0 ]]; then
     echo "Skipping SQL import as database is already populated."
-  elif [[ "$CHOICE" != "2" && "$CHOICE" != "7" ]]; then
+  elif [[ "$CHOICE" != "2" && "$CHOICE" != "8" ]]; then
     echo "Importing SQL file '$CONTAINER_SQL_FILE' into '$TARGET_DB'..."
     local import_output
     if command -v pv >/dev/null; then
@@ -1434,7 +1435,7 @@ jdbc.default.url=jdbc:mysql://localhost:3306/$TARGET_DB?useUnicode=true&characte
 jdbc.default.username=root
 jdbc.default.password=
 upgrade.database.dl.storage.check.disabled=true
-upgrade.database.preupgrade.verify.enabled=false
+upgrade.database.preupgrade.verify.enabled=true
 upgrade.database.preupgrade.data.cleanup.enabled=true
 EOF
   if [[ "$IS_DXP_CLOUD" == "true" ]]; then
@@ -1473,7 +1474,7 @@ jdbc.default.username=root
 jdbc.default.password=
 #liferay.home=${LIFERAY_DIR}
 upgrade.database.dl.storage.check.disabled=true
-upgrade.database.preupgrade.verify.enabled=false
+upgrade.database.preupgrade.verify.enabled=true
 upgrade.database.preupgrade.data.cleanup.enabled=true
 EOF
       # Enable multi-tenancy upgrade
@@ -1484,7 +1485,7 @@ jdbc.lportal.url=jdbc:mysql://localhost:3306/lportal?UTF-8&dontTrackOpenResource
 jdbc.lportal.username=root
 jdbc.lportal.password=
 #database.partition.enabled=true
-upgrade.database.preupgrade.verify.enabled=false
+upgrade.database.preupgrade.verify.enabled=true
 upgrade.database.preupgrade.data.cleanup.enabled=true
 
 database.partition.schemas=lportal,lpartition_11162231691175,lpartition_11706165,lpartition_11711847,lpartition_11726111,lpartition_11816620,lpartition_11819872,lpartition_11822045,lpartition_11940122,lpartition_13982314,lpartition_16684433639393,lpartition_17855804202317,lpartition_1860468,lpartition_18804743,lpartition_18807698,lpartition_1996101,lpartition_26053188,lpartition_45286218349995,lpartition_57868206215768,lpartition_66138412237889,lpartition_83909668433076,lpartition_9184961,lpartition_20097
@@ -1628,7 +1629,7 @@ jdbc.default.password=
 liferay.home=${LIFERAY_DIR}
 database.partition.enabled=true
 upgrade.database.dl.storage.check.disabled=true
-upgrade.database.preupgrade.verify.enabled=false
+upgrade.database.preupgrade.verify.enabled=true
 upgrade.database.preupgrade.data.cleanup.enabled=true
 EOF
           chmod 644 "$temp_properties_file" || { echo "Error: chmod on '$temp_properties_file'." >&2; return 644; }
