@@ -2,9 +2,8 @@
 #
 # Author: Brian Joyner Wulbern <brian.wulbern@liferay.com>
 # Platform: Linux/Unix
-# VERSION: 1.14.1
-# Added support for IPC and Sapphire
-# patch: fixed import logic for TUDelft; increased sleep for PostgreSQL Docker up check; toggled all upgrade.database.preupgrade.* properties to 'true'
+# VERSION: 1.16.0
+# Added support for OTIS and OPAP
 # 
 
 export_mysql_dump() {
@@ -361,7 +360,8 @@ import_postgresql() {
   echo "3. Jessa --> 24Q4_Jessa_database_dump.sql"
   echo "4. RWTH Aachen University --> 25Q1_RWTH_database_dump.sql"
   echo "5. Sapphire --> 25Q1_sapphire-postgres-20250415.sql"
-  echo "6. Other"
+  echo "6. Otis --> 2025Q1_lportal-postgresql-2025.q1.14-08182025.sql"
+  echo "7. Other"
   read -p "Enter your choice: " import_choice
   case $import_choice in
     1)
@@ -380,6 +380,9 @@ import_postgresql() {
       dump_file="25Q1_sapphire-postgres-20250415.sql"
       ;;
     6)
+      dump_file="2025Q1_lportal-postgresql-2025.q1.14-08182025.sql"
+      ;;
+    7)
       read -p "Enter the path to your PostgreSQL dump file: " dump_file
       ;;
     *)
@@ -829,8 +832,8 @@ jdbc.default.url=jdbc:sqlserver://localhost:1433;databaseName=lportal;trustServe
 jdbc.default.username=sa
 jdbc.default.password=R00t@1234
 upgrade.database.dl.storage.check.disabled=true
-#upgrade.database.preupgrade.verify.enabled=true
-#upgrade.database.preupgrade.data.cleanup.enabled=true
+upgrade.database.preupgrade.verify.enabled=true
+upgrade.database.preupgrade.data.cleanup.enabled=true
 EOF
 
   echo "portal-ext.properties created successfully in $LIFERAY_DIR."
@@ -864,8 +867,8 @@ jdbc.default.url=jdbc:sqlserver://localhost:1433;databaseName=lportal;trustServe
 jdbc.default.username=sa
 jdbc.default.password=R00t@1234
 upgrade.database.dl.storage.check.disabled=true
-#upgrade.database.preupgrade.verify.enabled=true
-#upgrade.database.preupgrade.data.cleanup.enabled=true
+upgrade.database.preupgrade.verify.enabled=true
+upgrade.database.preupgrade.data.cleanup.enabled=true
 EOF
 
     echo "portal-upgrade-database.properties updated successfully."
@@ -899,10 +902,11 @@ setup_and_import_mysql() {
   echo '4) CNO Bizlink'
   echo '5) IPC'
   echo '6) Metos'
-  echo '7) TUDelft'
-  echo '8) e5a2'  
-  echo '9) Other (custom path)'
-  echo '10) Liferay DXP Cloud'
+  echo '7) OPAP'
+  echo '8) TUDelft'
+  echo '9) e5a2'  
+  echo '10) Other (custom path)'
+  echo '11) Liferay DXP Cloud'
   read -rp 'Enter your choice: ' CHOICE
 
   case "$CHOICE" in
@@ -912,13 +916,14 @@ setup_and_import_mysql() {
     4) TARGET_DB="cno_bizlink_db"; ZIP_FILE="24Q1_CNOBizlink_database_dump.sql" ;;
     5) TARGET_DB="ipc_db"; ZIP_FILE="25Q1_ipc_dump_2025-05-05-164823.zip" ;;
     6) TARGET_DB="metos_db"; ZIP_FILE="24Q3_Metos_database_dump.zip" ;;
-    7) TARGET_DB="tudelft_db"; ZIP_FILE="24Q1_TUDelft_database_dump.sql" ;;
-    8) TARGET_DB="lportal"; ZIP_FILE="5ff380f7-ced4-4df3-bac0-6af9537f5c9d"
+    7) TARGET_DB="opap_db"; ZIP_FILE="2025Q1_opap_merged_dump_2025-09-04.sql" ;;
+    8) TARGET_DB="tudelft_db"; ZIP_FILE="24Q1_TUDelft_database_dump.sql" ;;
+    9) TARGET_DB="lportal"; ZIP_FILE="5ff380f7-ced4-4df3-bac0-6af9537f5c9d"
       MODL_CODE=e5a2
       ;;
-    9) read -rp "Enter the path to your custom dump zip: " ZIP_FILE
+    10) read -rp "Enter the path to your custom dump zip: " ZIP_FILE
        read -rp "Enter your target database name: " TARGET_DB ;;
-    10)
+    11)
       TARGET_DB="lportal"
       read -rp "Enter the LPD ticket number (e.g., LPD-52788): " LPD_TICKET
       read -rp "Enter the MODL code (e.g., r8k1): " MODL_CODE
@@ -976,13 +981,15 @@ setup_and_import_mysql() {
         --cpus=2 \
         $DOCKER_IMAGE \
         --default-time-zone='GMT' \
-        --innodb_buffer_pool_size=4G \
+        --innodb_buffer_pool_size=8G \
+        --innodb_doublewrite=0 \
+        --innodb_log_file_size=4G \
+        --innodb_flush_log_at_trx_commit=0 \
+        --innodb_io_capacity=4000 \
+        --innodb_write_io_threads=8 \
+        --lower_case_table_names=1 \
         --max-allowed-packet=943718400 \
         --wait-timeout=6000 \
-        --innodb_log_file_size=512M \
-        --innodb_flush_log_at_trx_commit=2 \
-        --innodb_io_capacity=2000 \
-        --innodb_write_io_threads=8 \
         --sync_binlog=0"
     else
       docker_run_cmd="docker run -d \
@@ -995,13 +1002,15 @@ setup_and_import_mysql() {
         --cpus=2 \
         $DOCKER_IMAGE \
         --default-time-zone='GMT' \
-        --innodb_buffer_pool_size=4G \
+        --innodb_buffer_pool_size=8G \
+        --innodb_doublewrite=0 \
+        --innodb_log_file_size=4G \
+        --innodb_flush_log_at_trx_commit=0 \
+        --innodb_io_capacity=4000 \
+        --innodb_write_io_threads=8 \
+        --lower_case_table_names=1 \
         --max-allowed-packet=943718400 \
         --wait-timeout=6000 \
-        --innodb_log_file_size=512M \
-        --innodb_flush_log_at_trx_commit=2 \
-        --innodb_io_capacity=2000 \
-        --innodb_write_io_threads=8 \
         --sync_binlog=0"
     fi
     if [[ "$IS_DXP_CLOUD" == "true" ]]; then
@@ -1010,10 +1019,11 @@ setup_and_import_mysql() {
       docker_run_cmd="$docker_run_cmd \
         --default-time-zone='GMT' \
         --innodb_buffer_pool_size=4G \
+        --lower_case_table_names=1 \
         --max-allowed-packet=943718400 \
         --wait-timeout=6000 \
         --innodb_log_file_size=512M \
-        --innodb_flush_log_at_trx_commit=2 \
+        --innodb_flush_log_at_trx_commit=0 \
         --innodb_io_capacity=2000 \
         --innodb_write_io_threads=8 \
         --sync_binlog=0"
@@ -1297,7 +1307,7 @@ setup_and_import_mysql() {
   # Skip import if database is already populated (checked earlier)
   if [[ "$IS_DXP_CLOUD" == "true" && -n "$table_count" && "$table_count" -gt 0 ]]; then
     echo "Skipping SQL import as database is already populated."
-  elif [[ "$CHOICE" != "2" && "$CHOICE" != "8" ]]; then
+  elif [[ "$CHOICE" != "2" && "$CHOICE" != "9" ]]; then
     echo "Importing SQL file '$CONTAINER_SQL_FILE' into '$TARGET_DB'..."
     local import_output
     if command -v pv >/dev/null; then
@@ -1435,7 +1445,7 @@ jdbc.default.url=jdbc:mysql://localhost:3306/$TARGET_DB?useUnicode=true&characte
 jdbc.default.username=root
 jdbc.default.password=
 upgrade.database.dl.storage.check.disabled=true
-upgrade.database.preupgrade.verify.enabled=true
+#upgrade.database.preupgrade.verify.enabled=true
 upgrade.database.preupgrade.data.cleanup.enabled=true
 EOF
   if [[ "$IS_DXP_CLOUD" == "true" ]]; then
@@ -1450,11 +1460,11 @@ company.default.web.id=admin-e5a2.lxc.liferay.com
 company.security.strangers.verify=false
 database.partition.enabled=true
 dl.store.file.system.lenient=true
-include-and-override=portal-liferay-online.properties
-jdbc.lportal.driverClassName=com.mysql.cj.jdbc.Driver
-jdbc.lportal.url=jdbc:mysql://localhost:3306/lportal?UTF-8&dontTrackOpenResources=true&holdResultsOpenOverStatementClose=true&GMT&useFastDateParsing=&useUnicode=
-jdbc.lportal.username=root
-jdbc.lportal.password=
+#include-and-override=portal-liferay-online.properties
+#jdbc.lportal.driverClassName=com.mysql.cj.jdbc.Driver
+#jdbc.lportal.url=jdbc:mysql://localhost:3306/lportal?UTF-8&dontTrackOpenResources=true&holdResultsOpenOverStatementClose=true&GMT&useFastDateParsing=&useUnicode=
+#jdbc.lportal.username=root
+#jdbc.lportal.password=
 EOF
   fi
   chmod 600 "$properties_file" || { echo "Error: Failed to set permissions on '$properties_file'." >&2; return 1; }
@@ -1474,131 +1484,132 @@ jdbc.default.username=root
 jdbc.default.password=
 #liferay.home=${LIFERAY_DIR}
 upgrade.database.dl.storage.check.disabled=true
-upgrade.database.preupgrade.verify.enabled=true
+#upgrade.database.preupgrade.verify.enabled=true
 upgrade.database.preupgrade.data.cleanup.enabled=true
 EOF
       # Enable multi-tenancy upgrade
     if [[ "$MODL_CODE" == "e5a2" ]]; then
       cat >> "$upgrade_properties_file" <<EOF || { echo "Error: Failed to create '$upgrade_properties_file'." >&2; return 2; }
-jdbc.lportal.driverClassName=com.mysql.cj.jdbc.Driver
-jdbc.lportal.url=jdbc:mysql://localhost:3306/lportal?UTF-8&dontTrackOpenResources=true&holdResultsOpenOverStatementClose=true&GMT&useFastDateParsing=&useUnicode=
-jdbc.lportal.username=root
-jdbc.lportal.password=
-#database.partition.enabled=true
-upgrade.database.preupgrade.verify.enabled=true
-upgrade.database.preupgrade.data.cleanup.enabled=true
+company.default.web.id=admin-e5a2.lxc.liferay.com      
+# jdbc.lportal.driverClassName=com.mysql.cj.jdbc.Driver
+# jdbc.lportal.url=jdbc:mysql://localhost:3306/lportal?UTF-8&dontTrackOpenResources=true&holdResultsOpenOverStatementClose=true&GMT&useFastDateParsing=&useUnicode=
+# jdbc.lportal.username=root
+# jdbc.lportal.password=
+# #database.partition.enabled=true
+# upgrade.database.preupgrade.verify.enabled=true
+# upgrade.database.preupgrade.data.cleanup.enabled=true
 
-database.partition.schemas=lportal,lpartition_11162231691175,lpartition_11706165,lpartition_11711847,lpartition_11726111,lpartition_11816620,lpartition_11819872,lpartition_11822045,lpartition_11940122,lpartition_13982314,lpartition_16684433639393,lpartition_17855804202317,lpartition_1860468,lpartition_18804743,lpartition_18807698,lpartition_1996101,lpartition_26053188,lpartition_45286218349995,lpartition_57868206215768,lpartition_66138412237889,lpartition_83909668433076,lpartition_9184961,lpartition_20097
+# database.partition.schemas=lportal,lpartition_11162231691175,lpartition_11706165,lpartition_11711847,lpartition_11726111,lpartition_11816620,lpartition_11819872,lpartition_11822045,lpartition_11940122,lpartition_13982314,lpartition_16684433639393,lpartition_17855804202317,lpartition_1860468,lpartition_18804743,lpartition_18807698,lpartition_1996101,lpartition_26053188,lpartition_45286218349995,lpartition_57868206215768,lpartition_66138412237889,lpartition_83909668433076,lpartition_9184961,lpartition_20097
 
-jdbc.lpartition_11162231691175.driverClassName=com.mysql.cj.jdbc.Driver
-jdbc.lpartition_11162231691175.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
-jdbc.lpartition_11162231691175.username=root
-jdbc.lpartition_11162231691175.password=
+# jdbc.lpartition_11162231691175.driverClassName=com.mysql.cj.jdbc.Driver
+# jdbc.lpartition_11162231691175.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
+# jdbc.lpartition_11162231691175.username=root
+# jdbc.lpartition_11162231691175.password=
 
-jdbc.lpartition_11706165.driverClassName=com.mysql.cj.jdbc.Driver
-jdbc.lpartition_11706165.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
-jdbc.lpartition_11706165.username=root
-jdbc.lpartition_11706165.password=
+# jdbc.lpartition_11706165.driverClassName=com.mysql.cj.jdbc.Driver
+# jdbc.lpartition_11706165.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
+# jdbc.lpartition_11706165.username=root
+# jdbc.lpartition_11706165.password=
 
-jdbc.lpartition_11711847.driverClassName=com.mysql.cj.jdbc.Driver
-jdbc.lpartition_11711847.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
-jdbc.lpartition_11711847.username=root
-jdbc.lpartition_11711847.password=
+# jdbc.lpartition_11711847.driverClassName=com.mysql.cj.jdbc.Driver
+# jdbc.lpartition_11711847.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
+# jdbc.lpartition_11711847.username=root
+# jdbc.lpartition_11711847.password=
 
-jdbc.lpartition_11726111.driverClassName=com.mysql.cj.jdbc.Driver
-jdbc.lpartition_11726111.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
-jdbc.lpartition_11726111.username=root
-jdbc.lpartition_11726111.password=
+# jdbc.lpartition_11726111.driverClassName=com.mysql.cj.jdbc.Driver
+# jdbc.lpartition_11726111.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
+# jdbc.lpartition_11726111.username=root
+# jdbc.lpartition_11726111.password=
 
-jdbc.lpartition_11816620.driverClassName=com.mysql.cj.jdbc.Driver
-jdbc.lpartition_11816620.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
-jdbc.lpartition_11816620.username=root
-jdbc.lpartition_11816620.password=
+# jdbc.lpartition_11816620.driverClassName=com.mysql.cj.jdbc.Driver
+# jdbc.lpartition_11816620.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
+# jdbc.lpartition_11816620.username=root
+# jdbc.lpartition_11816620.password=
 
-jdbc.lpartition_11819872.driverClassName=com.mysql.cj.jdbc.Driver
-jdbc.lpartition_11819872.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
-jdbc.lpartition_11819872.username=root
-jdbc.lpartition_11819872.password=
+# jdbc.lpartition_11819872.driverClassName=com.mysql.cj.jdbc.Driver
+# jdbc.lpartition_11819872.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
+# jdbc.lpartition_11819872.username=root
+# jdbc.lpartition_11819872.password=
 
-jdbc.lpartition_11822045.driverClassName=com.mysql.cj.jdbc.Driver
-jdbc.lpartition_11822045.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
-jdbc.lpartition_11822045.username=root
-jdbc.lpartition_11822045.password=
+# jdbc.lpartition_11822045.driverClassName=com.mysql.cj.jdbc.Driver
+# jdbc.lpartition_11822045.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
+# jdbc.lpartition_11822045.username=root
+# jdbc.lpartition_11822045.password=
 
-jdbc.lpartition_11940122.driverClassName=com.mysql.cj.jdbc.Driver
-jdbc.lpartition_11940122.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
-jdbc.lpartition_11940122.username=root
-jdbc.lpartition_11940122.password=
+# jdbc.lpartition_11940122.driverClassName=com.mysql.cj.jdbc.Driver
+# jdbc.lpartition_11940122.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
+# jdbc.lpartition_11940122.username=root
+# jdbc.lpartition_11940122.password=
 
-jdbc.lpartition_13982314.driverClassName=com.mysql.cj.jdbc.Driver
-jdbc.lpartition_13982314.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
-jdbc.lpartition_13982314.username=root
-jdbc.lpartition_13982314.password=
+# jdbc.lpartition_13982314.driverClassName=com.mysql.cj.jdbc.Driver
+# jdbc.lpartition_13982314.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
+# jdbc.lpartition_13982314.username=root
+# jdbc.lpartition_13982314.password=
 
-jdbc.lpartition_16684433639393.driverClassName=com.mysql.cj.jdbc.Driver
-jdbc.lpartition_16684433639393.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
-jdbc.lpartition_16684433639393.username=root
-jdbc.lpartition_16684433639393.password=
+# jdbc.lpartition_16684433639393.driverClassName=com.mysql.cj.jdbc.Driver
+# jdbc.lpartition_16684433639393.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
+# jdbc.lpartition_16684433639393.username=root
+# jdbc.lpartition_16684433639393.password=
 
-jdbc.lpartition_17855804202317.driverClassName=com.mysql.cj.jdbc.Driver
-jdbc.lpartition_17855804202317.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
-jdbc.lpartition_17855804202317.username=root
-jdbc.lpartition_17855804202317.password=
+# jdbc.lpartition_17855804202317.driverClassName=com.mysql.cj.jdbc.Driver
+# jdbc.lpartition_17855804202317.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
+# jdbc.lpartition_17855804202317.username=root
+# jdbc.lpartition_17855804202317.password=
 
-jdbc.lpartition_1860468.driverClassName=com.mysql.cj.jdbc.Driver
-jdbc.lpartition_1860468.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
-jdbc.lpartition_1860468.username=root
-jdbc.lpartition_1860468.password=
+# jdbc.lpartition_1860468.driverClassName=com.mysql.cj.jdbc.Driver
+# jdbc.lpartition_1860468.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
+# jdbc.lpartition_1860468.username=root
+# jdbc.lpartition_1860468.password=
 
-jdbc.lpartition_18804743.driverClassName=com.mysql.cj.jdbc.Driver
-jdbc.lpartition_18804743.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
-jdbc.lpartition_18804743.username=root
-jdbc.lpartition_18804743.password=
+# jdbc.lpartition_18804743.driverClassName=com.mysql.cj.jdbc.Driver
+# jdbc.lpartition_18804743.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
+# jdbc.lpartition_18804743.username=root
+# jdbc.lpartition_18804743.password=
 
-jdbc.lpartition_18807698.driverClassName=com.mysql.cj.jdbc.Driver
-jdbc.lpartition_18807698.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
-jdbc.lpartition_18807698.username=root
-jdbc.lpartition_18807698.password=
+# jdbc.lpartition_18807698.driverClassName=com.mysql.cj.jdbc.Driver
+# jdbc.lpartition_18807698.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
+# jdbc.lpartition_18807698.username=root
+# jdbc.lpartition_18807698.password=
 
-jdbc.lpartition_1996101.driverClassName=com.mysql.cj.jdbc.Driver
-jdbc.lpartition_1996101.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
-jdbc.lpartition_1996101.username=root
-jdbc.lpartition_1996101.password=
+# jdbc.lpartition_1996101.driverClassName=com.mysql.cj.jdbc.Driver
+# jdbc.lpartition_1996101.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
+# jdbc.lpartition_1996101.username=root
+# jdbc.lpartition_1996101.password=
 
-jdbc.lpartition_26053188.driverClassName=com.mysql.cj.jdbc.Driver
-jdbc.lpartition_26053188.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
-jdbc.lpartition_26053188.username=root
-jdbc.lpartition_26053188.password=
+# jdbc.lpartition_26053188.driverClassName=com.mysql.cj.jdbc.Driver
+# jdbc.lpartition_26053188.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
+# jdbc.lpartition_26053188.username=root
+# jdbc.lpartition_26053188.password=
 
-jdbc.lpartition_45286218349995.driverClassName=com.mysql.cj.jdbc.Driver
-jdbc.lpartition_45286218349995.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
-jdbc.lpartition_45286218349995.username=root
-jdbc.lpartition_45286218349995.password=
+# jdbc.lpartition_45286218349995.driverClassName=com.mysql.cj.jdbc.Driver
+# jdbc.lpartition_45286218349995.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
+# jdbc.lpartition_45286218349995.username=root
+# jdbc.lpartition_45286218349995.password=
 
-jdbc.lpartition_57868206215768.driverClassName=com.mysql.cj.jdbc.Driver
-jdbc.lpartition_57868206215768.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
-jdbc.lpartition_57868206215768.username=root
-jdbc.lpartition_57868206215768.password=
+# jdbc.lpartition_57868206215768.driverClassName=com.mysql.cj.jdbc.Driver
+# jdbc.lpartition_57868206215768.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
+# jdbc.lpartition_57868206215768.username=root
+# jdbc.lpartition_57868206215768.password=
 
-jdbc.lpartition_66138412237889.driverClassName=com.mysql.cj.jdbc.Driver
-jdbc.lpartition_66138412237889.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
-jdbc.lpartition_66138412237889.username=root
-jdbc.lpartition_66138412237889.password=
+# jdbc.lpartition_66138412237889.driverClassName=com.mysql.cj.jdbc.Driver
+# jdbc.lpartition_66138412237889.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
+# jdbc.lpartition_66138412237889.username=root
+# jdbc.lpartition_66138412237889.password=
 
-jdbc.lpartition_83909668433076.driverClassName=com.mysql.cj.jdbc.Driver
-jdbc.lpartition_83909668433076.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
-jdbc.lpartition_83909668433076.username=root
-jdbc.lpartition_83909668433076.password=
+# jdbc.lpartition_83909668433076.driverClassName=com.mysql.cj.jdbc.Driver
+# jdbc.lpartition_83909668433076.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
+# jdbc.lpartition_83909668433076.username=root
+# jdbc.lpartition_83909668433076.password=
 
-jdbc.lpartition_9184961.driverClassName=com.mysql.cj.jdbc.Driver
-jdbc.lpartition_9184961.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
-jdbc.lpartition_9184961.username=root
-jdbc.lpartition_9184961.password=
+# jdbc.lpartition_9184961.driverClassName=com.mysql.cj.jdbc.Driver
+# jdbc.lpartition_9184961.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
+# jdbc.lpartition_9184961.username=root
+# jdbc.lpartition_9184961.password=
 
-jdbc.lpartition_20097.driverClassName=com.mysql.cj.jdbc.Driver
-jdbc.lpartition_20097.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
-jdbc.lpartition_20097.username=root
-jdbc.lpartition_20097.password=
+# jdbc.lpartition_20097.driverClassName=com.mysql.cj.jdbc.Driver
+# jdbc.lpartition_20097.url=jdbc:mysql://localhost:3306/lportal?useUnicode=true&characterEncoding=UTF-8
+# jdbc.lpartition_20097.username=root
+# jdbc.lpartition_20097.password=
 EOF
     fi
 
@@ -1629,7 +1640,7 @@ jdbc.default.password=
 liferay.home=${LIFERAY_DIR}
 database.partition.enabled=true
 upgrade.database.dl.storage.check.disabled=true
-upgrade.database.preupgrade.verify.enabled=true
+#upgrade.database.preupgrade.verify.enabled=true
 upgrade.database.preupgrade.data.cleanup.enabled=true
 EOF
           chmod 644 "$temp_properties_file" || { echo "Error: chmod on '$temp_properties_file'." >&2; return 644; }
@@ -1868,7 +1879,7 @@ WHERE TABLE_SCHEMA='lportal'
 
 echo "Choose a database to set up and import:"
 echo "1. SQL Server"
-echo "2. MySQL (if APCOA, import first)"
+echo "2. MySQL (if apcoa or e5a2, import first)"
 echo "3. PostgreSQL"
 echo "4. Import apcoa dump"
 echo "5. Import e5a2 dump reusable"
