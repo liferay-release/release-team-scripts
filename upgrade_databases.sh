@@ -3,8 +3,8 @@
 # Author: Brian Joyner Wulbern <brian.wulbern@liferay.com>
 # Platform: Linux/Unix
 # VERSION: 1.17.0
+# Added ALTER TABLES logic directly in to 
 # Added properties to portal-upgrade-ext.properties instead of deprecated portal-upgrade-database.properties
-# Added support for OTIS and OPAP
 # 
 
 export_mysql_dump() {
