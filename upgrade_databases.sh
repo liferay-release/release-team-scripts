@@ -2,9 +2,9 @@
 #
 # Author: Brian Joyner Wulbern <brian.wulbern@liferay.com>
 # Platform: Linux/Unix
-# VERSION: 1.17.0
-# Added ALTER TABLES logic directly in to PostrgreSQL for Church Mutual and Sapphire
-# Added properties to portal-upgrade-ext.properties instead of deprecated portal-upgrade-database.properties
+# VERSION: 1.18.0
+# Streamlined process so we don't hit all the db_upgrade_tool prompts - 
+# Now it's only one prompt after import, then upon clicking enter, the bundle deletes, re-unzips, and upgrade completes
 # 
 
 export_mysql_dump() {
@@ -697,6 +697,9 @@ upgrade_postgresql_with_local_tomcat() {
     return 1
   fi
 
+  LIFERAY_HOME_ABS=$(pwd)/$LIFERAY_DIR
+  echo "LIFERAY_HOME_ABS set to: $LIFERAY_HOME_ABS" # For debugging
+
   echo "Using Tomcat version: $VERSION"
   echo "Tomcat directory: $TOMCAT_DIR"
 
@@ -726,12 +729,35 @@ jdbc.default.driverClassName=org.postgresql.Driver
 jdbc.default.url=jdbc:postgresql://localhost:5433/lportal
 jdbc.default.username=root
 jdbc.default.password=
+liferay.home=${LIFERAY_HOME_ABS}
+upgrade.database.dl.storage.check.disabled=true
+upgrade.database.preupgrade.verify.enabled=true
+upgrade.database.preupgrade.data.cleanup.enabled=true
+EOF
+
+    cat > portal-upgrade-database.properties <<EOF
+jdbc.default.driverClassName=org.postgresql.Driver
+jdbc.default.url=jdbc:postgresql://localhost:5433/lportal
+jdbc.default.username=root
+jdbc.default.password=
+liferay.home=${LIFERAY_HOME_ABS}
 upgrade.database.dl.storage.check.disabled=true
 upgrade.database.preupgrade.verify.enabled=true
 upgrade.database.preupgrade.data.cleanup.enabled=true
 EOF
 
     echo "portal-upgrade-ext.properties updated successfully."
+
+    echo "Creating app-server.properties..."
+    local upgrade_tool_dir="$LIFERAY_DIR/tools/portal-tools-db-upgrade-client"
+    local app_server_properties_file="app-server.properties"
+    cat > "$app_server_properties_file" <<EOF || { echo "Error: Failed to create '$app_server_properties_file'." >&2; return 2; }
+dir=${LIFERAY_HOME_ABS}/tomcat
+extra.lib.dirs=/bin
+global.lib.dir=/lib
+portal.dir=/webapps/ROOT
+server.detector.server.id=tomcat
+EOF
 
     echo "Running database upgrade script..."
     ./db_upgrade_client.sh -j "-Dfile.encoding=UTF-8 -Duser.timezone=GMT -Xmx4096m"
@@ -849,6 +875,9 @@ upgrade_sqlserver_with_local_tomcat() {
     return 1
   fi
 
+  LIFERAY_HOME_ABS=$(pwd)/$LIFERAY_DIR
+  echo "LIFERAY_HOME_ABS set to: $LIFERAY_HOME_ABS" # For debugging
+
   echo "Using Tomcat version: $VERSION"
   echo "Tomcat directory: $TOMCAT_DIR"
 
@@ -860,6 +889,7 @@ jdbc.default.driverClassName=com.microsoft.sqlserver.jdbc.SQLServerDriver
 jdbc.default.url=jdbc:sqlserver://localhost:1433;databaseName=lportal;trustServerCertificate=true;
 jdbc.default.username=sa
 jdbc.default.password=R00t@1234
+liferay.home=${LIFERAY_HOME_ABS}
 upgrade.database.dl.storage.check.disabled=true
 upgrade.database.preupgrade.verify.enabled=true
 upgrade.database.preupgrade.data.cleanup.enabled=true
@@ -895,12 +925,35 @@ jdbc.default.driverClassName=com.microsoft.sqlserver.jdbc.SQLServerDriver
 jdbc.default.url=jdbc:sqlserver://localhost:1433;databaseName=lportal;trustServerCertificate=true;
 jdbc.default.username=sa
 jdbc.default.password=R00t@1234
+liferay.home=${LIFERAY_HOME_ABS}
+upgrade.database.dl.storage.check.disabled=true
+upgrade.database.preupgrade.verify.enabled=true
+upgrade.database.preupgrade.data.cleanup.enabled=true
+EOF
+
+    cat > portal-upgrade-database.properties <<EOF
+jdbc.default.driverClassName=com.microsoft.sqlserver.jdbc.SQLServerDriver
+jdbc.default.url=jdbc:sqlserver://localhost:1433;databaseName=lportal;trustServerCertificate=true;
+jdbc.default.username=sa
+jdbc.default.password=R00t@1234
+liferay.home=${LIFERAY_HOME_ABS}
 upgrade.database.dl.storage.check.disabled=true
 upgrade.database.preupgrade.verify.enabled=true
 upgrade.database.preupgrade.data.cleanup.enabled=true
 EOF
 
     echo "portal-upgrade-ext.properties updated successfully."
+
+    echo "Creating app-server.properties..."
+    local upgrade_tool_dir="$LIFERAY_DIR/tools/portal-tools-db-upgrade-client"
+    local app_server_properties_file="app-server.properties"
+    cat > "$app_server_properties_file" <<EOF || { echo "Error: Failed to create '$app_server_properties_file'." >&2; return 2; }
+dir=${LIFERAY_HOME_ABS}/tomcat
+extra.lib.dirs=/bin
+global.lib.dir=/lib
+portal.dir=/webapps/ROOT
+server.detector.server.id=tomcat
+EOF
 
     echo "Running database upgrade script..."
     ./db_upgrade_client.sh -j "-Dfile.encoding=UTF-8 -Duser.timezone=GMT -Xmx4096m"
@@ -1467,6 +1520,9 @@ setup_and_import_mysql() {
     return 1
   fi
 
+  LIFERAY_HOME_ABS=$(pwd)/$LIFERAY_DIR
+  echo "LIFERAY_HOME_ABS set to: $LIFERAY_HOME_ABS" # For debugging
+
   echo "Creating portal-ext.properties..."
   local properties_file="$LIFERAY_DIR/portal-ext.properties"
   cat > "$properties_file" <<EOF || { echo "Error: Failed to create '$properties_file'." >&2; return 1; }
@@ -1479,6 +1535,7 @@ upgrade.database.dl.storage.check.disabled=true
 upgrade.database.preupgrade.verify.enabled=true
 upgrade.database.preupgrade.data.cleanup.enabled=true
 EOF
+
   if [[ "$IS_DXP_CLOUD" == "true" ]]; then
     cat >> "$properties_file" <<EOF || { echo "Error: Failed to append DXP Cloud properties to '$properties_file'." >&2; return 1; }
 company.default.web.id=admin-$MODL_CODE.lxc.liferay.com
@@ -1498,26 +1555,50 @@ dl.store.file.system.lenient=true
 #jdbc.lportal.password=
 EOF
   fi
-  chmod 600 "$properties_file" || { echo "Error: Failed to set permissions on '$properties_file'." >&2; return 1; }
-  debug "portal-ext.properties contents:"
-  cat "$properties_file" >&2
-  echo "portal-ext.properties updated successfully."
+  # chmod 600 "$properties_file" || { echo "Error: Failed to set permissions on '$properties_file'." >&2; return 1; }
+  # debug "portal-ext.properties contents:"
+  # cat "$properties_file" >&2
+  # echo "portal-ext.properties updated successfully."
 
   # Check for database upgrade tool
   local upgrade_tool_dir="$LIFERAY_DIR/tools/portal-tools-db-upgrade-client"
   if [[ -d "$upgrade_tool_dir" ]]; then
     echo "Creating portal-upgrade-ext.properties..."
-    local upgrade_properties_file="$upgrade_tool_dir/portal-upgrade-ext.properties"
-    cat > "$upgrade_properties_file" <<EOF || { echo "Error: Failed to create '$upgrade_properties_file'." >&2; return 2; }
+    local upgrade_properties_ext_file="$upgrade_tool_dir/portal-upgrade-ext.properties"
+    cat > "$upgrade_properties_ext_file" <<EOF || { echo "Error: Failed to create '$upgrade_properties_ext_file'." >&2; return 2; }
 jdbc.default.driverClassName=com.mysql.cj.jdbc.Driver
-jdbc.default.url=jdbc:mysql://localhost:3306/${TARGET_DB}?${characterEncoding=UTF-8}&dontTrackOpenResources=true&holdResultsOpenOverStatementClose=true&${serverTimezone=GMT}&useFastDateParsing=${false}&useUnicode=${true}
+jdbc.default.url=jdbc:mysql://localhost:3306/${TARGET_DB}?characterEncoding=UTF-8&dontTrackOpenResources=true&holdResultsOpenOverStatementClose=true&serverTimezone=GMT&useFastDateParsing=false&useUnicode=true
 jdbc.default.username=root
 jdbc.default.password=
-#liferay.home=${LIFERAY_DIR}
+liferay.home=${LIFERAY_HOME_ABS}
 upgrade.database.dl.storage.check.disabled=true
 upgrade.database.preupgrade.verify.enabled=true
 upgrade.database.preupgrade.data.cleanup.enabled=true
 EOF
+
+    echo "Creating portal-upgrade-database.properties..."
+    local upgrade_properties_file="$upgrade_tool_dir/portal-upgrade-database.properties"
+    cat > "$upgrade_properties_file" <<EOF || { echo "Error: Failed to create '$upgrade_properties_file'." >&2; return 2; }
+jdbc.default.driverClassName=com.mysql.cj.jdbc.Driver
+jdbc.default.url=jdbc:mysql://localhost:3306/${TARGET_DB}?characterEncoding=UTF-8&dontTrackOpenResources=true&holdResultsOpenOverStatementClose=true&serverTimezone=GMT&useFastDateParsing=false&useUnicode=true
+jdbc.default.username=root
+jdbc.default.password=
+liferay.home=${LIFERAY_HOME_ABS}
+upgrade.database.dl.storage.check.disabled=true
+upgrade.database.preupgrade.verify.enabled=true
+upgrade.database.preupgrade.data.cleanup.enabled=true
+EOF
+
+    echo "Creating app-server.properties..."
+    local app_server_properties_file="$upgrade_tool_dir/app-server.properties"
+    cat > "$app_server_properties_file" <<EOF || { echo "Error: Failed to create '$app_server_properties_file'." >&2; return 2; }
+dir=${LIFERAY_HOME_ABS}/tomcat
+extra.lib.dirs=/bin
+global.lib.dir=/lib
+portal.dir=/webapps/ROOT
+server.detector.server.id=tomcat
+EOF
+
       # Enable multi-tenancy upgrade
     if [[ "$MODL_CODE" == "e5a2" ]]; then
       cat >> "$upgrade_properties_file" <<EOF || { echo "Error: Failed to create '$upgrade_properties_file'." >&2; return 2; }
@@ -1668,7 +1749,7 @@ jdbc.default.driverClassName=com.mysql.cj.jdbc.Driver
 jdbc.default.url=jdbc:mysql://localhost:3306/${partition}?characterEncoding=UTF-8&dontTrackOpenResources=true&holdResultsOpenOverStatementClose}&serverTimezone=GMT&useFastDateParsing=false&useUnicode=true}
 jdbc.default.username=root
 jdbc.default.password=
-liferay.home=${LIFERAY_DIR}
+#liferay.home=${LIFERAY_DIR}
 database.partition.enabled=true
 upgrade.database.dl.storage.check.disabled=true
 upgrade.database.preupgrade.verify.enabled=true
