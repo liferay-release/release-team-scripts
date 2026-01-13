@@ -2,9 +2,8 @@
 #
 # Author: Brian Joyner Wulbern <brian.wulbern@liferay.com>
 # Platform: Linux/Unix
-# VERSION: 1.18.0
-# Streamlined process so we don't hit all the db_upgrade_tool prompts - 
-# Now it's only one prompt after import, then upon clicking enter, the bundle deletes, re-unzips, and upgrade completes
+# VERSION: 1.19.0
+# Add Oracle upgrade support
 # 
 
 export_mysql_dump() {
@@ -294,105 +293,273 @@ import_mysql_dump() {
 }
 
 import_oracle() {
-  echo "Importing Oracle database..."
+  local ORACLE_CONTAINER_NAME="oracle_db"
+  local ORACLE_PDB_NAME="FREEPDB1"
+  local SYSTEM_PASSWORD="LportalPassword123"
+  local CONTAINER_DP_DIR="/opt/oracle/dpdump"
+  local DUMP_FILE_NAME=""
+  local DUMP_FILE_PATH=""
+  local alteration_sql=""
 
   declare -A databases=(
-    ["1"]="Actinver --> dump.dmp"
-    ["2"]="Argus --> dump2.dmp"
+    [1]="CNO Bizlink --> cno_bizlink_dump.dmp"
+    [2]="Tokio Marine --> 25Q3_tokio_marine_old.dmp"
   )
 
-  echo "Choose a database to import:"
+  echo "Choose a database to import (.dmp file):"
   for i in "${!databases[@]}"; do
-    echo "$i. ${databases[$i]}"
+    echo "$i. ${databases[$i]%% --> *}"
   done
+  local OTHER_CHOICE=$(( ${#databases[@]} + 1 ))
+  echo "$OTHER_CHOICE. Other (custom .dmp file path/name)"
+  read -p "Enter your choice: " import_choice
 
-  echo "8. Other"
+  if [[ "$import_choice" =~ ^[0-9]+$ ]] && [[ "$import_choice" -ge 1 ]] && [[ "$import_choice" -le ${#databases[@]} ]]; then
+    DUMP_FILE_NAME="${databases[$import_choice]##*--> }"
+    DUMP_FILE_PATH="./$DUMP_FILE_NAME"
+  elif [[ "$import_choice" == "$OTHER_CHOICE" ]]; then
+    read -p "Enter the full path to your .dmp file: " DUMP_FILE_PATH
+    DUMP_FILE_NAME=$(basename "$DUMP_FILE_PATH")
+  else
+    echo "Invalid choice! ❌"
+    return 1
+  fi
 
-  while true; do
-    read -rp "Enter your choice: " choice
-    if [[ $choice =~ ^[1-8]$ ]]; then
-      break
+  if [[ ! -f "$DUMP_FILE_PATH" ]]; then
+    echo "Error: Dump file '$DUMP_FILE_PATH' not found. ⚠️"
+    return 1
+  fi
+
+  echo "Copying $DUMP_FILE_NAME into container volume..."
+  docker cp "$DUMP_FILE_PATH" "$ORACLE_CONTAINER_NAME":"$CONTAINER_DP_DIR/$DUMP_FILE_NAME"
+  if [ $? -ne 0 ]; then
+    echo "Error: Failed to copy dump file via docker cp. ❌"
+    return 1
+  fi
+
+  if docker exec "$ORACLE_CONTAINER_NAME" ls "$CONTAINER_DP_DIR/$DUMP_FILE_NAME" > /dev/null 2>&1; then
+    echo "Dump file successfully placed in container volume. ✅"
+  else
+    echo "Critical Error: File not found inside container after copy. ❌"
+    return 1
+  fi
+
+  if ! docker ps --filter "name=^${ORACLE_CONTAINER_NAME}$" --format '{{.Names}}' | grep -q "^${ORACLE_CONTAINER_NAME}$"; then
+    echo "Error: Oracle container not running. Run run_oracle() first. ❌"
+    return 1
+  fi
+
+
+  echo "Executing Data Pump import (PDB directory + no log file)..."
+
+  local impdp_output
+  impdp_output=$(docker exec -u oracle "$ORACLE_CONTAINER_NAME" bash -c "
+    source /home/oracle/.bashrc
+    impdp \"SYSTEM/$SYSTEM_PASSWORD@$ORACLE_PDB_NAME\" \
+      DIRECTORY=LPORTAL_IMPORT_DIR \
+      DUMPFILE=$DUMP_FILE_NAME \
+      NOLOGFILE=Y \
+      REMAP_SCHEMA=ADMLIFRYEXT:LPORTAL \
+      TABLE_EXISTS_ACTION=REPLACE \
+      FULL=Y
+  " 2>&1)
+
+  local impdp_exit_code=$?
+
+  if [ $impdp_exit_code -eq 0 ] || [ $impdp_exit_code -eq 5 ] || echo "$impdp_output" | grep -qi "completed"; then
+    echo "Database imported (completed with possible warnings)! 🎉"
+    echo "$impdp_output" > "impdp_console_${DUMP_FILE_NAME}.txt"
+  else
+    echo "Import failed critically (exit code $impdp_exit_code). Console tail:"
+    echo "$impdp_output" | tail -n 50
+    return 1
+  fi
+
+  if [ -n "$alteration_sql" ]; then
+    echo "Running post-import table alteration..."
+    docker exec -u oracle "$ORACLE_CONTAINER_NAME" bash -c "
+      source /home/oracle/.bashrc
+      sqlplus -S \"/ as sysdba\"@$ORACLE_PDB_NAME <<SQL
+        SET SQLBLANKLINES ON
+        $alteration_sql
+        COMMIT;
+        EXIT;
+SQL
+    "
+    if [ $? -eq 0 ]; then
+      echo "Table alteration completed successfully! ✅"
     else
-      echo "Invalid choice. Please enter a number between 1 and 8."
+      echo "Warning: Table alteration failed (non-critical). Continuing... ⚠️"
     fi
-  done
+  fi
+}
 
-  if [[ $choice == 8 ]]; then
-    read -rp "Enter the path to your Oracle dump file (.dmp): " DUMP_FILE
-  elif [[ $choice =~ ^[1-7]$ ]]; then
-    DUMP_FILE="${databases[$choice]##*--> }"
+run_oracle() {
+  local ORACLE_CONTAINER_NAME="oracle_db"
+  local ORACLE_IMAGE="container-registry.oracle.com/database/free:latest"
+  local ORACLE_PASSWORD="LportalPassword123"
+  local LPORTAL_PASSWORD="LPORTAL"
+  local ORACLE_PDB_NAME="FREEPDB1"
+  local ORACLE_CDB_SERVICE="FREE"
+  local CONTAINER_DP_DIR="/opt/oracle/dpdump"
+  local start_container=1
+
+  if docker ps --filter "name=^${ORACLE_CONTAINER_NAME}$" --format '{{.Names}}' | grep -q "^${ORACLE_CONTAINER_NAME}$"; then
+    echo "Oracle container '$ORACLE_CONTAINER_NAME' is already running. Checking if database is ready..."
+    if docker logs "$ORACLE_CONTAINER_NAME" 2>/dev/null | grep -q "DATABASE IS READY TO USE!"; then
+      echo "Database is already initialized and ready! Skipping container startup. 🎉"
+      start_container=0
+      if docker exec -u oracle "$ORACLE_CONTAINER_NAME" bash -c "
+        source /home/oracle/.bashrc
+        echo \"SELECT OPEN_MODE FROM V\\\$PDBS WHERE NAME = '${ORACLE_PDB_NAME^^}' AND OPEN_MODE = 'READ WRITE';\" | 
+        sqlplus -S / as sysdba | grep -q 'READ WRITE'
+      "; then
+        echo "PDB $ORACLE_PDB_NAME is open READ WRITE. Proceeding..."
+      else
+        echo "Warning: PDB not fully open — continuing anyway (may be transient)."
+      fi
+    else
+      echo "Container running but database not ready. Restarting..."
+      docker rm -f "$ORACLE_CONTAINER_NAME"
+    fi
+  else
+    echo "No running Oracle container found. Starting fresh..."
   fi
 
-  if [[ -z "$DUMP_FILE" ]]; then
-    echo "No dump file specified. Skipping import."
-    return 1
+  if [[ $start_container -eq 1 ]]; then
+    docker volume create oracle-dpdump 2>/dev/null || true
+
+    echo "Starting Oracle Database Free container..."
+    docker run -d \
+      --name "${ORACLE_CONTAINER_NAME}" \
+      --platform linux/amd64 \
+      -e ORACLE_PWD="$ORACLE_PASSWORD" \
+      -p 1521:1521 \
+      --volume oracle-dpdump:"$CONTAINER_DP_DIR" \
+      --memory=16g \
+      --cpus=6 \
+      --shm-size=4g \
+      "$ORACLE_IMAGE"
+
+    if [ $? -ne 0 ]; then
+      echo "Failed to start Oracle container. ❌"
+      return 1
+    fi
+
+    echo "⏳ Waiting for database to report ready (1–4 min first time)... ⏳"
+    local max_attempts=16
+    local attempt=1
+    until docker logs "$ORACLE_CONTAINER_NAME" 2>/dev/null | grep -q "DATABASE IS READY TO USE!"; do
+      if [[ $attempt -gt $max_attempts ]]; then
+        echo "Error: Timed out waiting for database. Check logs: docker logs $ORACLE_CONTAINER_NAME ❌"
+        return 1
+      fi
+      printf " Attempt %3d/%d – waiting 15 seconds...\r" $attempt $max_attempts
+      sleep 15
+      attempt=$((attempt + 1))
+    done
+    echo
+    echo "Database is ready! Finalizing..."
+    sleep 10
   fi
 
-  if [[ ! -f "$DUMP_FILE" ]]; then
-    echo "Dump file '$DUMP_FILE' not found. Skipping import."
-    return 1
+  echo "Ensuring LPORTAL user exists in PDB ($ORACLE_PDB_NAME)..."
+  docker exec -u oracle "$ORACLE_CONTAINER_NAME" bash -c "
+    source /home/oracle/.bashrc
+    sqlplus -S / as sysdba <<SQL
+      ALTER SESSION SET \"_ORACLE_SCRIPT\"=true;
+
+      -- Switch to PDB
+      ALTER SESSION SET CONTAINER = $ORACLE_PDB_NAME;
+
+      -- Create tablespace only if not exists
+      BEGIN
+        EXECUTE IMMEDIATE 'CREATE TABLESPACE TOKIOMARINE DATAFILE ''tokiomarine01.dbf'' SIZE 100M AUTOEXTEND ON NEXT 100M MAXSIZE UNLIMITED';
+      EXCEPTION
+        WHEN OTHERS THEN
+          IF SQLCODE != -01543 THEN RAISE; END IF;
+      END;
+      /
+
+      -- Drop and recreate LPORTAL user
+      BEGIN
+        EXECUTE IMMEDIATE 'DROP USER LPORTAL CASCADE';
+      EXCEPTION
+        WHEN OTHERS THEN
+          IF SQLCODE != -1918 THEN RAISE; END IF;
+      END;
+      /
+
+      CREATE USER LPORTAL IDENTIFIED BY \"$LPORTAL_PASSWORD\" DEFAULT TABLESPACE USERS;
+      GRANT CONNECT, RESOURCE, DBA TO LPORTAL;
+      GRANT IMP_FULL_DATABASE TO LPORTAL;
+      ALTER USER LPORTAL QUOTA UNLIMITED ON USERS;
+
+      -- Create directory in PDB (for impdp)
+      CREATE OR REPLACE DIRECTORY LPORTAL_IMPORT_DIR AS '/opt/oracle/dpdump';
+      GRANT READ, WRITE ON DIRECTORY LPORTAL_IMPORT_DIR TO PUBLIC;
+
+      EXIT;
+SQL
+  "
+  if [ $? -eq 0 ]; then
+    echo "LPORTAL user configured successfully! ✅"
+  else
+    echo "Warning: Issue creating LPORTAL user — check manually. ⚠️"
   fi
 
-  if [[ ! "$DUMP_FILE" == *.dmp ]]; then
-    echo "Invalid file type.  Oracle import requires a .dmp file (Data Pump export)."
-    return 1
-  fi
-
-  chmod a+r "$DUMP_FILE"
-
-  if ! docker cp "$DUMP_FILE" oracle_db:/opt/oracle/admin/ORCLCDB/dpdump/; then
-    echo "Error copying dump file to Oracle container. Check Docker and file permissions."
-    return 1
-  fi
-
-  echo "Dump file copied to Oracle container.  Execute the following command *inside* the container (as the oracle user):"
-  echo "impdp LPORTAL/1234@ORCLCDB dumpfile=$(basename "$DUMP_FILE") logfile=LPORTAL.log remap_schema=LPORTAL:LPORTAL table_exists_action=replace"
-
-  echo "Or, if you've set up a directory object in Oracle:"
-  echo "impdp LPORTAL/1234@ORCLCDB directory=DATA_PUMP_DIR dumpfile=$(basename "$DUMP_FILE") logfile=LPORTAL.log remap_schema=LPORTAL:LPORTAL table_exists_action=replace"
-
-  echo "Remember to replace LPORTAL/1234 with your actual username and password, and ORCLCDB with your service name."
+  echo
+  echo "Oracle Database Free is fully ready!"
+  echo "• Use docker cp to place .dmp files into the volume:"
+  echo "  docker cp your_dump.dmp ${ORACLE_CONTAINER_NAME}:${CONTAINER_DP_DIR}/"
+  echo "• Logs: docker logs -f ${ORACLE_CONTAINER_NAME}"
+  echo
 }
 
 import_postgresql() {
   echo "Choose a database to import:"
-  echo "1. Ovam --> 24Q3_OVAM_database_dump.sql"
+  echo "1. Balearia --> 02-dump_20250924-2.sql"
   echo "2. Church Mutual --> 24Q3_ChurchMutual_database_dump.sql"
-  echo "3. Jessa --> 24Q4_Jessa_database_dump.sql"
-  echo "4. RWTH Aachen University --> 25Q1_RWTH_database_dump.sql"
-  echo "5. Sapphire --> 25Q1_sapphire-postgres-20250415.sql"
-  echo "6. Otis --> 2025Q1_lportal-postgresql-2025.q1.14-08182025.sql"
-  echo "7. Other"
+  echo "3. DPESP --> 25Q3_dpesp_dump_20251013.sql"
+  echo "4. Jessa --> 24Q4_Jessa_database_dump.sql"
+  echo "5. Otis --> 2025Q1_lportal-postgresql-2025.q1.14-08182025.sql"
+  echo "6. Ovam --> 24Q3_OVAM_database_dump.sql"
+  echo "7. RWTH Aachen University --> 25Q1_RWTH_database_dump.sql"
+  echo "8. Sapphire --> 25Q1_sapphire-postgres-20250415.sql"
+  echo "9. Other"
   read -p "Enter your choice: " import_choice
   
-  # Initialize dump_file and alteration_sql variables
   dump_file=""
   alteration_sql=""
 
   case $import_choice in
     1)
-      dump_file="24Q3_OVAM_database_dump.sql"
+      dump_file="02-dump_20250924-2.sql"
       ;;
     2)
       dump_file="24Q3_ChurchMutual_database_dump.sql"
-      # SQL to run after successful import for choice 2
       alteration_sql="ALTER TABLE public.cpdefinition_x_20102 ALTER COLUMN cpdefinitionid SET NOT NULL;"
       ;;
     3)
-      dump_file="24Q4_Jessa_database_dump.sql"
+      dump_file="25Q3_dpesp_dump_20251013.sql"
       ;;
     4)
-      dump_file="25Q1_RWTH_database_dump.sql"
+      dump_file="24Q4_Jessa_database_dump.sql"
       ;;
     5)
-      dump_file="25Q1_sapphire-postgres-20250415.sql"
-      # SQL to run after successful import for choice 5
-      alteration_sql="ALTER TABLE public.cpdefinition_x_20097 ALTER COLUMN cpdefinitionid SET NOT NULL;"
-      ;;
-    6)
       dump_file="2025Q1_lportal-postgresql-2025.q1.14-08182025.sql"
       ;;
+    6)
+      dump_file="24Q3_OVAM_database_dump.sql"
+      ;;
     7)
+      dump_file="25Q1_RWTH_database_dump.sql"
+      ;;
+    8)
+      dump_file="25Q1_sapphire-postgres-20250415.sql"
+      alteration_sql="ALTER TABLE public.cpdefinition_x_20097 ALTER COLUMN cpdefinitionid SET NOT NULL;"
+      ;;
+    8)
       read -p "Enter the path to your PostgreSQL dump file: " dump_file
       ;;
     *)
@@ -403,25 +570,19 @@ import_postgresql() {
 
   if [ -f "$dump_file" ]; then
     echo "Importing PostgreSQL database from **$dump_file**..."
-    # Import the database dump file
     docker exec -i postgresql_db psql -q -U root -d lportal < "$dump_file"
     
     if [ $? -eq 0 ]; then
       echo "Database imported successfully! 🎉"
       
-      # Check if an alteration is required
       if [ -n "$alteration_sql" ]; then
         echo "Running post-import table alteration..."
-        # Execute the ALTER TABLE command using docker exec
-        # The -c flag allows psql to execute a single command (the SQL string)
         docker exec postgresql_db psql -U root -d lportal -c "$alteration_sql"
         
         if [ $? -eq 0 ]; then
           echo "Table alteration completed successfully! ✅"
         else
           echo "Error: Table alteration failed!"
-          # Decide if you want to exit here or just continue
-          # For robustness, we'll just report the error and continue
         fi
       fi
       
@@ -456,7 +617,7 @@ import_sqlserver() {
     if [[ "$choice" =~ ^[1-4]$ ]]; then
       break
     else
-      echo "Invalid choice. Please enter a number between 1 and 4."
+      echo "Invalid choice. Please enter a number between 1 and 4. ❌"
     fi
   done
 
@@ -481,20 +642,20 @@ import_sqlserver() {
   docker exec -it sqlserver_db mkdir -p /var/opt/mssql/backup
 
   if ! docker cp "$DUMP_FILE" sqlserver_db:/var/opt/mssql/backup; then
-    echo "Error copying dump file to container. Check Docker and file permissions."
+    echo "Error copying dump file to container. Check Docker and file permissions. ❌"
     exit 1
   fi
 
   echo "Dump file copied to SQL Server container."
 
-  echo "Waiting for SQL Server to be ready..."
+  echo "⏳ Waiting for SQL Server to be ready...⏳"
   for i in {1..30}; do
     docker exec sqlserver_db /opt/mssql-tools18/bin/sqlcmd -S localhost -U SA -P 'R00t@1234' -d master -C -Q "SELECT 1" > /dev/null 2>&1
     if [ $? -eq 0 ]; then
       echo "SQL Server is ready!"
       break
     fi
-    echo "Waiting for SQL Server... ($i/30)"
+    echo "⏳ Waiting for SQL Server... ($i/30) ⏳"
     sleep 2
   done
 
@@ -503,7 +664,7 @@ import_sqlserver() {
 
   file_list=$(docker exec -it sqlserver_db /opt/mssql-tools18/bin/sqlcmd -S localhost -U SA -P 'R00t@1234' -d master -C -Q "RESTORE FILELISTONLY FROM DISK = '/var/opt/mssql/backup/$filename'" 2>&1)
   if echo "$file_list" | grep -q "Msg [0-9]\+,"; then
-    echo "Error listing files in backup. Check SQL Server logs in the container."
+    echo "Error listing files in backup. Check SQL Server logs in the container. ❌"
     docker exec -it sqlserver_db cat /var/opt/mssql/log/errorlog
     exit 1
   fi
@@ -580,27 +741,149 @@ import_sqlserver() {
   fi
 }
 
-run_oracle() {
-  if docker ps -aqf name=oracle_db > /dev/null; then
-    echo "Container 'oracle_db' already exists. Removing..."
-    docker rm -f oracle_db
+upgrade_oracle_with_local_tomcat() {
+  local LIFERAY_DIR="liferay-dxp"
+  local ORACLE_JDBC_JAR="ojdbc11.jar"
+  local ORACLE_USER="LPORTAL"
+  local ORACLE_PASSWORD="LPORTAL"
+  local ORACLE_PDB_SERVICE="FREEPDB1"
+  local JDBC_URL="jdbc:oracle:thin:@//localhost:1521/$ORACLE_PDB_SERVICE"
+  local JDBC_DRIVER="oracle.jdbc.OracleDriver"
+
+  echo "Starting Liferay DXP Tomcat setup + Database Upgrade for Oracle 19c..."
+
+  local TOMCAT_ARCHIVE=""
+  while [[ -z "$TOMCAT_ARCHIVE" || ! -f "$TOMCAT_ARCHIVE" ]]; do
+    read -rp "Enter the full path to your Liferay DXP Tomcat bundle (.zip or .tar.gz), or press Enter to auto-search current directory: " user_input
+
+    if [[ -z "$user_input" ]]; then
+      echo "Searching current directory for Liferay Tomcat bundle..."
+      TOMCAT_ARCHIVE=$(find . -maxdepth 1 \( \
+        -name "liferay-dxp-tomcat-7.4*.zip" -o \
+        -name "liferay-dxp-tomcat-7.4*.tar.gz" -o \
+        -name "liferay-dxp-tomcat-202[4-9]*.zip" -o \
+        -name "liferay-dxp-tomcat-202[4-9]*.tar.gz" -o \
+        -name "liferay-fixed.zip" \) | head -n 1)
+
+      if [[ -z "$TOMCAT_ARCHIVE" ]]; then
+        echo "No Liferay Tomcat bundle found in current directory. Please provide a path." >&2
+        continue
+      fi
+    else
+      TOMCAT_ARCHIVE="$user_input"
+    fi
+
+    if [[ ! -f "$TOMCAT_ARCHIVE" ]]; then
+      echo "File not found: $TOMCAT_ARCHIVE. Try again." >&2
+      TOMCAT_ARCHIVE=""
+    fi
+  done
+
+  echo "Using bundle: $TOMCAT_ARCHIVE"
+
+
+  if [[ -d "$LIFERAY_DIR" ]]; then
+    echo "Removing existing '$LIFERAY_DIR' directory..."
+    rm -rf "$LIFERAY_DIR" || { echo "Failed to remove old directory. ❌"; return 1; }
   fi
 
-  echo "Setting up Oracle 19 environment..."
-  mkdir -p ~/oracle/{dump,oradata,scripts-setup}
-  cat <<EOF > ~/oracle/Dockerfile
-FROM oracle/database:19.3.0-se2
-COPY --chown=54321:54322 dump /opt/oracle/import
-COPY --chown=54321:54322 oradata /opt/oracle/oradata
-COPY --chown=54321:54322 scripts-setup /opt/oracle/scripts/setup
-EOF
-  docker build -t oracle/database:19.3.0-se2 ~/oracle
-  docker run --name oracle_db -p 1521:1521 oracle/database:19.3.0-se2
-  if [ $? -eq 0 ]; then
-    echo "Oracle container started successfully!"
+  echo "Extracting bundle..."
+  if [[ "$TOMCAT_ARCHIVE" == *.zip ]]; then
+    unzip -q "$TOMCAT_ARCHIVE" || { echo "Failed to unzip archive. ❌"; return 1; }
+  elif [[ "$TOMCAT_ARCHIVE" == *.tar.gz ]]; then
+    tar -xzf "$TOMCAT_ARCHIVE" || { echo "Failed to extract tar.gz archive. ❌"; return 1; }
   else
-    echo "Failed to start Oracle container."
+    echo "Unsupported archive format. ❌"; return 1
   fi
+
+  if [[ ! -d "$LIFERAY_DIR" ]]; then
+    echo "Extraction failed – expected directory '$LIFERAY_DIR' not found. ❌"
+    return 1
+  fi
+
+  local LIFERAY_HOME_ABS="$(pwd)/$LIFERAY_DIR"
+  echo "Liferay home set to: $LIFERAY_HOME_ABS"
+
+  if [[ ! -d "$LIFERAY_DIR/tomcat" ]]; then
+    echo "Error: tomcat directory missing after extraction. ❌"
+    ls -la "$LIFERAY_DIR"
+    return 1
+  fi
+
+  cat > "$LIFERAY_DIR/portal-ext.properties" <<EOF
+jdbc.default.driverClassName=$JDBC_DRIVER
+jdbc.default.url=$JDBC_URL
+jdbc.default.username=$ORACLE_USER
+jdbc.default.password=$ORACLE_PASSWORD
+upgrade.database.dl.storage.check.disabled=true
+upgrade.database.preupgrade.verify.enabled=true
+upgrade.database.preupgrade.data.cleanup.enabled=true
+EOF
+
+  local SHIELDED_LIB="$LIFERAY_DIR/tomcat/webapps/ROOT/WEB-INF/shielded-container-lib"
+  if [[ -f "$ORACLE_JDBC_JAR" ]]; then
+    mkdir -p "$SHIELDED_LIB"
+    cp "$ORACLE_JDBC_JAR" "$SHIELDED_LIB/" && echo "JDBC driver copied." || echo "JDBC copy failed (non-critical)."
+  else
+    echo "Warning: ojdbc11.jar not found. Download from Oracle and place here."
+  fi
+
+  local UPGRADE_DIR="$LIFERAY_DIR/tools/portal-tools-db-upgrade-client"
+  if [[ ! -d "$UPGRADE_DIR" ]]; then
+    echo "Upgrade tool dir not found: $UPGRADE_DIR. ❌"
+    ls -la "$LIFERAY_DIR/tools"
+    return 1
+  fi
+  cd "$UPGRADE_DIR" || return 1
+
+  rm -f portal-upgrade-*.properties app-server.properties 2>/dev/null
+
+  cat > portal-upgrade-ext.properties <<EOF
+jdbc.default.driverClassName=$JDBC_DRIVER
+jdbc.default.url=$JDBC_URL
+jdbc.default.username=$ORACLE_USER
+jdbc.default.password=$ORACLE_PASSWORD
+liferay.home=${LIFERAY_HOME_ABS}
+upgrade.database.dl.storage.check.disabled=true
+upgrade.database.preupgrade.verify.enabled=true
+upgrade.database.preupgrade.data.cleanup.enabled=true
+EOF
+
+  cat > portal-upgrade-database.properties <<EOF
+jdbc.default.driverClassName=$JDBC_DRIVER
+jdbc.default.url=$JDBC_URL
+jdbc.default.username=$ORACLE_USER
+jdbc.default.password=$ORACLE_PASSWORD
+liferay.home=${LIFERAY_HOME_ABS}
+upgrade.database.dl.storage.check.disabled=true
+upgrade.database.preupgrade.verify.enabled=true
+upgrade.database.preupgrade.data.cleanup.enabled=true
+EOF
+
+  cat > app-server.properties <<EOF
+dir=$LIFERAY_HOME_ABS/tomcat
+extra.lib.dirs=bin
+global.lib.dir=lib
+portal.dir=webapps/ROOT
+server.detector.server.id=tomcat
+EOF
+
+  echo "Starting database upgrade..."
+  local upgrade_log="upgrade_$(date +%Y%m%d_%H%M%S).log"
+  ./db_upgrade_client.sh -j "-Dfile.encoding=UTF-8 -Duser.timezone=GMT -Xmx4096m" 2>&1 | tee "$upgrade_log"
+
+  if [ ${PIPESTATUS[0]} -eq 0 ]; then
+    echo "Upgrade completed successfully! 🎉"
+    echo "Start Liferay: $LIFERAY_HOME_ABS/tomcat/bin/startup.sh"
+    echo "Log: $(pwd)/$upgrade_log"
+  else
+    echo "Upgrade failed. Check $(pwd)/$upgrade_log for details. ❌"
+    tail -n 50 "$upgrade_log"
+    return 1
+  fi
+
+  cd - >/dev/null
+  echo "Liferay DXP Tomcat setup and Oracle upgrade complete!"
 }
 
 run_postgresql() {
@@ -615,9 +898,18 @@ run_postgresql() {
     -e POSTGRES_HOST_AUTH_METHOD=trust \
     -e POSTGRES_DB=lportal \
     -p 5433:5432 \
-    postgres:15.5
+    --memory=8g \
+    --cpus=2 \
+    postgres:15.5 \
+    postgres \
+    -c shared_buffers=2GB \
+    -c max_wal_size=4GB \
+    -c synchronous_commit=off \
+    -c checkpoint_timeout=30min \
+    -c wal_buffers=16MB \
+    -c maintenance_work_mem=1GB
   if [ $? -eq 0 ]; then
-    echo "Waiting for PostgreSQL to be ready..."
+    echo "⏳Waiting for PostgreSQL to be ready...⏳"
     until docker exec postgresql_db pg_isready -U root -h localhost; do
       sleep 10
     done
@@ -753,9 +1045,9 @@ EOF
     local app_server_properties_file="app-server.properties"
     cat > "$app_server_properties_file" <<EOF || { echo "Error: Failed to create '$app_server_properties_file'." >&2; return 2; }
 dir=${LIFERAY_HOME_ABS}/tomcat
-extra.lib.dirs=/bin
-global.lib.dir=/lib
-portal.dir=/webapps/ROOT
+extra.lib.dirs=bin
+global.lib.dir=lib
+portal.dir=webapps/ROOT
 server.detector.server.id=tomcat
 EOF
 
@@ -790,7 +1082,7 @@ run_sqlserver() {
     exit 1
   fi
 
-  echo "Waiting for SQL Server to be ready..."
+  echo "⏳Waiting for SQL Server to be ready...⏳"
   # Initial delay to allow container to start logging
   sleep 5
   # Timeout after 60 seconds
@@ -813,7 +1105,8 @@ run_sqlserver() {
 upgrade_sqlserver_with_local_tomcat() {
   local TOMCAT_DIR="$1"
   local TOMCAT_ARCHIVE="$2"
-  local MSSQL_JDBC_JAR="mssql-jdbc-12.2.0.jre8.jar"
+  local MSSQL_JDBC_JAR="mssql-jdbc-12.8.2.jre11.jar"
+  #local MSSQL_JDBC_JAR="mssql-jdbc-12.2.0.jre8.jar"
 
   echo "Starting Tomcat setup..."
 
@@ -949,9 +1242,9 @@ EOF
     local app_server_properties_file="app-server.properties"
     cat > "$app_server_properties_file" <<EOF || { echo "Error: Failed to create '$app_server_properties_file'." >&2; return 2; }
 dir=${LIFERAY_HOME_ABS}/tomcat
-extra.lib.dirs=/bin
-global.lib.dir=/lib
-portal.dir=/webapps/ROOT
+extra.lib.dirs=bin
+global.lib.dir=lib
+portal.dir=webapps/ROOT
 server.detector.server.id=tomcat
 EOF
 
@@ -981,32 +1274,38 @@ setup_and_import_mysql() {
   echo '1) Actinver'
   echo '2) APCOA'
   echo '3) Argus'
-  echo '4) CNO Bizlink'
-  echo '5) IPC'
-  echo '6) Metos'
-  echo '7) OPAP'
-  echo '8) TUDelft'
-  echo '9) e5a2'  
-  echo '10) Other (custom path)'
-  echo '11) Liferay DXP Cloud'
-  echo '12) d4a3'
+  echo '4) Bosch'
+  echo '5) CNO Bizlink'
+  echo '6) IPC'
+  echo '7) Metos'
+  echo '8) OPAP'
+  echo '9) TBG Internet'
+  echo '10) TBG Intranet'
+  echo '11) TUDelft'
+  echo '12) e5a2'  
+  echo '13) Other (custom path)'
+  echo '14) Liferay DXP Cloud'
+  echo '15) d4a3'
   read -rp 'Enter your choice: ' CHOICE
 
   case "$CHOICE" in
     1) TARGET_DB="actinver_db"; ZIP_FILE="24Q1_Actinver_database_dump.zip" ;;
     2) TARGET_DB="apcoa_db"; ZIP_FILE="24Q2_APCOA_database_dump.sql" ;;
     3) TARGET_DB="argus_db"; ZIP_FILE="24Q2_Argus_database_dump.sql" ;;
-    4) TARGET_DB="cno_bizlink_db"; ZIP_FILE="24Q1_CNOBizlink_database_dump.sql" ;;
-    5) TARGET_DB="ipc_db"; ZIP_FILE="25Q1_ipc_dump_2025-05-05-164823.zip" ;;
-    6) TARGET_DB="metos_db"; ZIP_FILE="24Q3_Metos_database_dump.zip" ;;
-    7) TARGET_DB="opap_db"; ZIP_FILE="2025Q1_opap_merged_dump_2025-09-04.sql" ;;
-    8) TARGET_DB="tudelft_db"; ZIP_FILE="24Q1_TUDelft_database_dump.sql" ;;
-    9) TARGET_DB="lportal"; ZIP_FILE="5ff380f7-ced4-4df3-bac0-6af9537f5c9d"
+    4) TARGET_DB="bosch_db"; ZIP_FILE="25Q2_bosch_dump.sql" ;;
+    5) TARGET_DB="cno_bizlink_db"; ZIP_FILE="24Q1_CNOBizlink_database_dump.sql" ;;
+    6) TARGET_DB="ipc_db"; ZIP_FILE="25Q1_ipc_dump_2025-05-05-164823.zip" ;;
+    7) TARGET_DB="metos_db"; ZIP_FILE="24Q3_Metos_database_dump.zip" ;;
+    8) TARGET_DB="opap_db"; ZIP_FILE="2025Q1_opap_merged_dump_2025-09-04.sql" ;;
+    9) TARGET_DB="tbg_internet"; ZIP_FILE="25Q3_tbg_internet_dump.sql" ;;
+    10) TARGET_DB="tbg_intranet"; ZIP_FILE="25Q3_tbg_intranet_dump.sql" ;;
+    11) TARGET_DB="tudelft_db"; ZIP_FILE="24Q1_TUDelft_database_dump.sql" ;;
+    12) TARGET_DB="lportal"; ZIP_FILE="5ff380f7-ced4-4df3-bac0-6af9537f5c9d"
       MODL_CODE=e5a2
       ;;
-    10) read -rp "Enter the path to your custom dump zip: " ZIP_FILE
+    13) read -rp "Enter the path to your custom dump zip: " ZIP_FILE
        read -rp "Enter your target database name: " TARGET_DB ;;
-    11)
+    14)
       TARGET_DB="lportal"
       read -rp "Enter the LPD ticket number (e.g., LPD-52788): " LPD_TICKET
       read -rp "Enter the MODL code (e.g., r8k1): " MODL_CODE
@@ -1016,7 +1315,7 @@ setup_and_import_mysql() {
       DOCKER_IMAGE="liferay/database-upgrades:$LPD_TICKET"
       IS_DXP_CLOUD=true
       ;;
-    12) TARGET_DB="lportal"; ZIP_FILE="dump-d4a3.sql" ;;
+    15) TARGET_DB="lportal"; ZIP_FILE="dump-d4a3.sql" ;;
     *)
       echo "Invalid MySQL choice." >&2
       return 1
@@ -1391,7 +1690,7 @@ setup_and_import_mysql() {
   # Skip import if database is already populated (checked earlier)
   if [[ "$IS_DXP_CLOUD" == "true" && -n "$table_count" && "$table_count" -gt 0 ]]; then
     echo "Skipping SQL import as database is already populated."
-  elif [[ "$CHOICE" != "2" && "$CHOICE" != "9" ]]; then
+  elif [[ "$CHOICE" != "2" && "$CHOICE" != "12" ]]; then
     echo "Importing SQL file '$CONTAINER_SQL_FILE' into '$TARGET_DB'..."
     local import_output
     if command -v pv >/dev/null; then
@@ -1593,9 +1892,9 @@ EOF
     local app_server_properties_file="$upgrade_tool_dir/app-server.properties"
     cat > "$app_server_properties_file" <<EOF || { echo "Error: Failed to create '$app_server_properties_file'." >&2; return 2; }
 dir=${LIFERAY_HOME_ABS}/tomcat
-extra.lib.dirs=/bin
-global.lib.dir=/lib
-portal.dir=/webapps/ROOT
+extra.lib.dirs=bin
+global.lib.dir=lib
+portal.dir=webapps/ROOT
 server.detector.server.id=tomcat
 EOF
 
@@ -1855,14 +2154,14 @@ import_sqlserver_rsync() {
 
   echo "Dump file copied to SQL Server container."
 
-  echo "Waiting for SQL Server to be ready..."
+  echo "⏳Waiting for SQL Server to be ready...⏳"
   for i in {1..30}; do
     docker exec sqlserver_db /opt/mssql-tools18/bin/sqlcmd -S localhost -U SA -P 'R00t@1234' -d master -C -Q "SELECT 1" > /dev/null 2>&1
     if [ $? -eq 0 ]; then
       echo "SQL Server is ready!"
       break
     fi
-    echo "Waiting for SQL Server... ($i/30)"
+    echo "⏳Waiting for SQL Server... ($i/30) ⏳"
     sleep 2
   done
 
@@ -1993,10 +2292,11 @@ echo "Choose a database to set up and import:"
 echo "1. SQL Server"
 echo "2. MySQL (if apcoa or e5a2, import first)"
 echo "3. PostgreSQL"
-echo "4. Import apcoa dump"
-echo "5. Import e5a2 dump reusable"
-echo "6. Import e5a2 dump hardcoded"
-echo "7. Stop and drop mysql_db container"
+echo "4. Oracle"
+echo "5. Import apcoa dump"
+echo "6. Import e5a2 dump reusable"
+echo "7. Import e5a2 dump hardcoded"
+echo "8. Stop and drop mysql_db container"
 read -p "Enter your choice (1/2/3/4/5/6/7): " CHOICE
 
 case $CHOICE in
@@ -2016,15 +2316,20 @@ case $CHOICE in
     upgrade_postgresql_with_local_tomcat
     ;;
   4)
-    import_mysql_dump "apcoa_db" "24Q2_APCOA_database_dump.sql"
+    run_oracle
+    import_oracle
+    upgrade_oracle_with_local_tomcat
     ;;
   5)
-    import_mysql_dump "lportal" "5ff380f7-ced4-4df3-bac0-6af9537f5c9d"
+    import_mysql_dump "apcoa_db" "24Q2_APCOA_database_dump.sql"
     ;;
   6)
-    import_e5a2_dump "lportal" "5ff380f7-ced4-4df3-bac0-6af9537f5c9d"
+    import_mysql_dump "lportal" "5ff380f7-ced4-4df3-bac0-6af9537f5c9d"
     ;;
   7)
+    import_e5a2_dump "lportal" "5ff380f7-ced4-4df3-bac0-6af9537f5c9d"
+    ;;
+  8)
     stop_drop_mysql_db
     ;;
   *)
