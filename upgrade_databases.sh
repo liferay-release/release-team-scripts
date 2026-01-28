@@ -2,8 +2,8 @@
 #
 # Author: Brian Joyner Wulbern <brian.wulbern@liferay.com>
 # Platform: Linux/Unix
-# VERSION: 1.19.0
-# Add Oracle upgrade support
+# VERSION: 1.21.0
+# Add support for more Oracle DBs
 # 
 
 export_mysql_dump() {
@@ -301,35 +301,81 @@ import_oracle() {
   local DUMP_FILE_PATH=""
   local alteration_sql=""
 
-  declare -A databases=(
-    [1]="CNO Bizlink --> cno_bizlink_dump.dmp"
-    [2]="Tokio Marine --> 25Q3_tokio_marine_old.dmp"
+  # === Dump metadata arrays ===
+  declare -A dump_names=(
+    [1]="CNO Bizlink"
+    [2]="Cuscal"
+    [3]="Tokio Marine"
   )
 
+  declare -A dump_files=(
+    [1]="cno_bizlink_dump.dmp"
+    [2]="25Q1_cuscal_dump_upgraded_with_kt_changes.dmp"
+    [3]="25Q3_tokio_marine_old.dmp"
+  )
+
+  # Primary remap owner per dump (used first)
+  declare -A dump_remap_primary=(
+    [1]="ORIGINAL_OWNER_FOR_CNO"      # TODO: fill in when known
+    [2]="CUSCAL"
+    [3]="ADMLIFRYEXT"
+  )
+
+  # Optional secondary owner (e.g. variants like LPORTAL_CUSCAL_73)
+  declare -A dump_remap_secondary=(
+    [2]="LPORTAL_CUSCAL_73"           # from Cuscal errors
+  )
+
+  # Primary tablespace per dump
+  declare -A dump_remap_tablespace=(
+    [1]="ORIGINAL_TBS_FOR_CNO"
+    [2]="TOKIOMARINE"
+    [3]="USERS"
+  )
+
+  # === Menu ===
   echo "Choose a database to import (.dmp file):"
-  for i in "${!databases[@]}"; do
-    echo "$i. ${databases[$i]%% --> *}"
+
+  for i in $(seq 1 ${#dump_files[@]}); do
+    echo "$i. ${dump_names[$i]}"
   done
-  local OTHER_CHOICE=$(( ${#databases[@]} + 1 ))
+
+  local OTHER_CHOICE=$(( ${#dump_files[@]} + 1 ))
   echo "$OTHER_CHOICE. Other (custom .dmp file path/name)"
+
   read -p "Enter your choice: " import_choice
 
-  if [[ "$import_choice" =~ ^[0-9]+$ ]] && [[ "$import_choice" -ge 1 ]] && [[ "$import_choice" -le ${#databases[@]} ]]; then
-    DUMP_FILE_NAME="${databases[$import_choice]##*--> }"
+  local remap_from=""
+  local remap_tablespace="USERS"  # default
+
+  if [[ "$import_choice" =~ ^[0-9]+$ ]] && [[ "$import_choice" -ge 1 ]] && [[ "$import_choice" -le ${#dump_files[@]} ]]; then
+    DUMP_FILE_NAME="${dump_files[$import_choice]}"
     DUMP_FILE_PATH="./$DUMP_FILE_NAME"
+
+    remap_from="${dump_remap_primary[$import_choice]:-LPORTAL}"
+    remap_tablespace="${dump_remap_tablespace[$import_choice]:-USERS}"
+
+    echo "Selected: ${dump_names[$import_choice]} ($DUMP_FILE_NAME)"
+    echo "Primary remap schema: $remap_from → LPORTAL"
+    echo "Tablespace remap: $remap_tablespace → USERS"
   elif [[ "$import_choice" == "$OTHER_CHOICE" ]]; then
-    read -p "Enter the full path to your .dmp file: " DUMP_FILE_PATH
-    DUMP_FILE_NAME=$(basename "$DUMP_FILE_PATH")
+    read -p "Enter source schema owner to remap from (e.g. CUSCAL, leave blank for no remap): " custom_remap_from
+    remap_from="${custom_remap_from:-LPORTAL}"
+    read -p "Enter source tablespace to remap from (e.g. TOKIOMARINE, leave blank for USERS): " custom_remap_tbs
+    remap_tablespace="${custom_remap_tbs:-USERS}"
   else
     echo "Invalid choice! ❌"
     return 1
   fi
 
+  # Early file existence check
   if [[ ! -f "$DUMP_FILE_PATH" ]]; then
     echo "Error: Dump file '$DUMP_FILE_PATH' not found. ⚠️"
+    ls -l *.dmp 2>/dev/null || echo "No .dmp files found in current directory."
     return 1
   fi
 
+  # Copy dump
   echo "Copying $DUMP_FILE_NAME into container volume..."
   docker cp "$DUMP_FILE_PATH" "$ORACLE_CONTAINER_NAME":"$CONTAINER_DP_DIR/$DUMP_FILE_NAME"
   if [ $? -ne 0 ]; then
@@ -344,13 +390,14 @@ import_oracle() {
     return 1
   fi
 
+  # Ensure container is running
   if ! docker ps --filter "name=^${ORACLE_CONTAINER_NAME}$" --format '{{.Names}}' | grep -q "^${ORACLE_CONTAINER_NAME}$"; then
     echo "Error: Oracle container not running. Run run_oracle() first. ❌"
     return 1
   fi
 
-
-  echo "Executing Data Pump import (PDB directory + no log file)..."
+  # === Execute impdp ===
+  echo "Executing Data Pump import (remapping from $remap_from + known variants)..."
 
   local impdp_output
   impdp_output=$(docker exec -u oracle "$ORACLE_CONTAINER_NAME" bash -c "
@@ -359,22 +406,46 @@ import_oracle() {
       DIRECTORY=LPORTAL_IMPORT_DIR \
       DUMPFILE=$DUMP_FILE_NAME \
       NOLOGFILE=Y \
-      REMAP_SCHEMA=ADMLIFRYEXT:LPORTAL \
+      REMAP_SCHEMA=$remap_from:LPORTAL \
+      REMAP_SCHEMA=LPORTAL_CUSCAL_73:LPORTAL \
+      REMAP_TABLESPACE=$remap_tablespace:USERS \
       TABLE_EXISTS_ACTION=REPLACE \
-      FULL=Y
+      FULL=Y \
+      METRICS=YES
   " 2>&1)
 
   local impdp_exit_code=$?
 
-  if [ $impdp_exit_code -eq 0 ] || [ $impdp_exit_code -eq 5 ] || echo "$impdp_output" | grep -qi "completed"; then
+  echo "$impdp_output" > "impdp_console_${DUMP_FILE_NAME}.txt"
+  echo "Console output saved to impdp_console_${DUMP_FILE_NAME}.txt"
+
+  # Show relevant summary
+  echo "Import summary (last 50 lines + key phrases):"
+  tail -n 50 "impdp_console_${DUMP_FILE_NAME}.txt" | grep -i "error\|skip\|schema\|owner\|tablespace\|user\|create\|remap\|processing\|object\|metrics\|completed\|warning" || echo "No key phrases found in tail."
+
+  if [ $impdp_exit_code -eq 0 ] || [ $impdp_exit_code -eq 5 ] || echo "$impdp_output" | grep -qi "successfully completed"; then
     echo "Database imported (completed with possible warnings)! 🎉"
-    echo "$impdp_output" > "impdp_console_${DUMP_FILE_NAME}.txt"
   else
     echo "Import failed critically (exit code $impdp_exit_code). Console tail:"
     echo "$impdp_output" | tail -n 50
     return 1
   fi
 
+  # Post-import: ensure LPORTAL has unlimited quota on common tablespaces
+  echo "Ensuring LPORTAL has unlimited quota..."
+docker exec -u oracle "$ORACLE_CONTAINER_NAME" sqlplus "SYSTEM/$SYSTEM_PASSWORD@$ORACLE_PDB_NAME" <<EOF
+  ALTER USER LPORTAL QUOTA UNLIMITED ON USERS;
+  ALTER USER LPORTAL QUOTA UNLIMITED ON TOKIOMARINE;
+  EXIT;
+EOF
+
+  # Optional: try to copy any log file (even if NOLOGFILE=Y)
+  docker cp "$ORACLE_CONTAINER_NAME:$CONTAINER_DP_DIR/impdp*.log" . 2>/dev/null || true
+  if [[ -f "impdp*.log" ]]; then
+    echo "Log file copied (if it exists)."
+  fi
+
+  # Your alteration_sql block (if any)
   if [ -n "$alteration_sql" ]; then
     echo "Running post-import table alteration..."
     docker exec -u oracle "$ORACLE_CONTAINER_NAME" bash -c "
@@ -427,6 +498,8 @@ run_oracle() {
   fi
 
   if [[ $start_container -eq 1 ]]; then
+    docker rm -f "$ORACLE_CONTAINER_NAME" 2>/dev/null || true
+
     docker volume create oracle-dpdump 2>/dev/null || true
 
     echo "Starting Oracle Database Free container..."
@@ -1288,6 +1361,8 @@ setup_and_import_mysql() {
   echo '15) d4a3'
   read -rp 'Enter your choice: ' CHOICE
 
+  alteration_sql=""
+
   case "$CHOICE" in
     1) TARGET_DB="actinver_db"; ZIP_FILE="24Q1_Actinver_database_dump.zip" ;;
     2) TARGET_DB="apcoa_db"; ZIP_FILE="24Q2_APCOA_database_dump.sql" ;;
@@ -1295,7 +1370,9 @@ setup_and_import_mysql() {
     4) TARGET_DB="bosch_db"; ZIP_FILE="25Q2_bosch_dump.sql" ;;
     5) TARGET_DB="cno_bizlink_db"; ZIP_FILE="24Q1_CNOBizlink_database_dump.sql" ;;
     6) TARGET_DB="ipc_db"; ZIP_FILE="25Q1_ipc_dump_2025-05-05-164823.zip" ;;
-    7) TARGET_DB="metos_db"; ZIP_FILE="24Q3_Metos_database_dump.zip" ;;
+    7) TARGET_DB="metos_db"; ZIP_FILE="24Q3_Metos_database_dump.zip"
+       alteration_sql="DELETE FROM Configuration_ WHERE configurationId = 'com.liferay.portal.tika.internal.configuration.TikaConfiguration';"
+      ;;
     8) TARGET_DB="opap_db"; ZIP_FILE="2025Q1_opap_merged_dump_2025-09-04.sql" ;;
     9) TARGET_DB="tbg_internet"; ZIP_FILE="25Q3_tbg_internet_dump.sql" ;;
     10) TARGET_DB="tbg_intranet"; ZIP_FILE="25Q3_tbg_intranet_dump.sql" ;;
@@ -1754,6 +1831,33 @@ setup_and_import_mysql() {
   else
     echo "Skipping SQL import for choice 2 (apcoa)"
   fi
+
+  if [ -n "$alteration_sql" ]; then
+        echo "Running post-setup table alterations on MySQL (${TARGET_DB})..."
+
+        local alter_cmd="SET FOREIGN_KEY_CHECKS=0; SET UNIQUE_CHECKS=0; SET SESSION sql_mode='';"
+        alter_cmd+=$'\n'"${alteration_sql}"
+
+        # Build mysql command WITHOUT quoting the -D value
+        local mysql_args=(-u root -D "$TARGET_DB" -e "$alter_cmd")
+        if [[ -n "$MYSQL_ROOT_PASSWORD" ]]; then
+            mysql_args+=(-p"$MYSQL_ROOT_PASSWORD")
+        fi
+
+        echo "Executing alterations..." >&2
+        docker exec "$MYSQL_CONTAINER_NAME" mysql "${mysql_args[@]}" 2>&1 | tee /tmp/alteration.log
+
+        if [ "${PIPESTATUS[0]}" -eq 0 ]; then
+            echo "MySQL table alterations completed successfully! ✅"
+            rm -f /tmp/alteration.log
+        else
+            echo "Error: MySQL table alterations failed!" >&2
+            echo "Last 20 lines of output:" >&2
+            tail -n 20 /tmp/alteration.log >&2
+            rm -f /tmp/alteration.log
+            return 1
+        fi
+    fi
 
   rm -f /tmp/mysql.cnf
   rm -rf "$temp_dir"
@@ -2297,7 +2401,8 @@ echo "5. Import apcoa dump"
 echo "6. Import e5a2 dump reusable"
 echo "7. Import e5a2 dump hardcoded"
 echo "8. Stop and drop mysql_db container"
-read -p "Enter your choice (1/2/3/4/5/6/7): " CHOICE
+echo "9. Clean Oracle container (stop/rm oracle_db)"
+read -p "Enter your choice (1/2/3/4/5/6/7/8/9): " CHOICE
 
 case $CHOICE in
   1)
@@ -2331,6 +2436,12 @@ case $CHOICE in
     ;;
   8)
     stop_drop_mysql_db
+    ;;
+  9)
+    echo "Cleaning Oracle container..."
+    docker stop oracle_db 2>/dev/null || true
+    docker rm oracle_db 2>/dev/null || true
+    echo "Oracle container cleaned. Ready for fresh start."
     ;;
   *)
     echo "Invalid choice. Exiting."
