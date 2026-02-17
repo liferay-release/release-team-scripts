@@ -2,8 +2,8 @@
 #
 # Author: Brian Joyner Wulbern <brian.wulbern@liferay.com>
 # Platform: Linux/Unix
-# VERSION: 1.21.0
-# Add support for more Oracle DBs
+# VERSION: 1.22.0
+# Add support for upgrading e5a2 (mysql)
 # 
 
 export_mysql_dump() {
@@ -66,41 +66,28 @@ EOF
 import_e5a2_dump() {
   local MYSQL_CONTAINER_NAME="mysql_db"
   local TARGET_DB="lportal"
-  local INPUT_FILE="5ff380f7-ced4-4df3-bac0-6af9537f5c9d"
+  local INPUT_FILE="lxce5a2-e5a2prd.gz"
+  
+  # 1. Handle Password Logic
+  local PWD_ARG=""
+  [[ -n "$MYSQL_ROOT_PASSWORD" ]] && PWD_ARG="-p$MYSQL_ROOT_PASSWORD"
 
-  # Check if pv is installed
-  if ! command -v pv >/dev/null 2>&1; then
-    echo "Error: pv not installed locally." >&2
-    return 1
-  fi
-
-  # Check input file
-  [[ ! -f "$INPUT_FILE" ]] && { echo "Error: Input file '$INPUT_FILE' does not exist." >&2; return 1; }
-
-  # Check if container is running
-  if ! docker ps --filter "name=^${MYSQL_CONTAINER_NAME}$" --format '{{.Names}}' | grep -q "^${MYSQL_CONTAINER_NAME}$"; then
-    echo "Error: MySQL container '$MYSQL_CONTAINER_NAME' is not running." >&2
-    return 1
-  fi
-
-  # Copy dump file to container
-  echo "Copying '$INPUT_FILE' to container..."
-  docker cp "$INPUT_FILE" "$MYSQL_CONTAINER_NAME:/tmp/$INPUT_FILE" || {
-    echo "Error copying dump file to container." >&2
+  # 2. Ensure Database Exists (The fix for Error 1049)
+  echo "Ensuring database '$TARGET_DB' exists..."
+  docker exec -i "$MYSQL_CONTAINER_NAME" mysql -u root $PWD_ARG -e "CREATE DATABASE IF NOT EXISTS \`$TARGET_DB\`;" || {
+    echo "Error: Could not create/access database '$TARGET_DB'." >&2
     return 1
   }
 
-  # Import with pv
+  # 3. Import with Decompression
   echo "Importing '$INPUT_FILE' into '$TARGET_DB'..."
-  pv "$INPUT_FILE" | docker exec -i "$MYSQL_CONTAINER_NAME" mysql -u root -p"$MYSQL_ROOT_PASSWORD" "$TARGET_DB" || {
+  # Note: Use zcat to decompress the .gz stream directly into mysql
+  zcat "$INPUT_FILE" | pv | docker exec -i "$MYSQL_CONTAINER_NAME" mysql -u root $PWD_ARG "$TARGET_DB" || {
     echo "Error importing dump file." >&2
-    docker exec "$MYSQL_CONTAINER_NAME" rm "/tmp/$INPUT_FILE"
     return 1
   }
 
-  # Clean up
-  docker exec "$MYSQL_CONTAINER_NAME" rm "/tmp/$INPUT_FILE"
-  echo "Database '$TARGET_DB' imported successfully from '$INPUT_FILE'."
+  echo "Database '$TARGET_DB' imported successfully."
 }
 
 import_mysql_dump() {
@@ -301,7 +288,7 @@ import_oracle() {
   local DUMP_FILE_PATH=""
   local alteration_sql=""
 
-  # === Dump metadata arrays ===
+  # Dump metadata arrays
   declare -A dump_names=(
     [1]="CNO Bizlink"
     [2]="Cuscal"
@@ -314,26 +301,14 @@ import_oracle() {
     [3]="25Q3_tokio_marine_old.dmp"
   )
 
-  # Primary remap owner per dump (used first)
-  declare -A dump_remap_primary=(
-    [1]="ORIGINAL_OWNER_FOR_CNO"      # TODO: fill in when known
-    [2]="CUSCAL"
-    [3]="ADMLIFRYEXT"
-  )
+  # Optional remap per choice (only add when needed)
+  local remap_arg=""
+  if [[ "$import_choice" == "2" ]]; then  # Cuscal
+    remap_arg="REMAP_SCHEMA=LPORTAL_CUSCAL_73:LPORTAL"
+  elif [[ "$import_choice" == "3" ]]; then  # Tokio Marine
+    remap_arg="REMAP_SCHEMA=ADMLIFRYEXT:LPORTAL"
+  fi
 
-  # Optional secondary owner (e.g. variants like LPORTAL_CUSCAL_73)
-  declare -A dump_remap_secondary=(
-    [2]="LPORTAL_CUSCAL_73"           # from Cuscal errors
-  )
-
-  # Primary tablespace per dump
-  declare -A dump_remap_tablespace=(
-    [1]="ORIGINAL_TBS_FOR_CNO"
-    [2]="TOKIOMARINE"
-    [3]="USERS"
-  )
-
-  # === Menu ===
   echo "Choose a database to import (.dmp file):"
 
   for i in $(seq 1 ${#dump_files[@]}); do
@@ -345,41 +320,29 @@ import_oracle() {
 
   read -p "Enter your choice: " import_choice
 
-  local remap_from=""
-  local remap_tablespace="USERS"  # default
-
   if [[ "$import_choice" =~ ^[0-9]+$ ]] && [[ "$import_choice" -ge 1 ]] && [[ "$import_choice" -le ${#dump_files[@]} ]]; then
     DUMP_FILE_NAME="${dump_files[$import_choice]}"
     DUMP_FILE_PATH="./$DUMP_FILE_NAME"
-
-    remap_from="${dump_remap_primary[$import_choice]:-LPORTAL}"
-    remap_tablespace="${dump_remap_tablespace[$import_choice]:-USERS}"
-
     echo "Selected: ${dump_names[$import_choice]} ($DUMP_FILE_NAME)"
-    echo "Primary remap schema: $remap_from → LPORTAL"
-    echo "Tablespace remap: $remap_tablespace → USERS"
   elif [[ "$import_choice" == "$OTHER_CHOICE" ]]; then
-    read -p "Enter source schema owner to remap from (e.g. CUSCAL, leave blank for no remap): " custom_remap_from
-    remap_from="${custom_remap_from:-LPORTAL}"
-    read -p "Enter source tablespace to remap from (e.g. TOKIOMARINE, leave blank for USERS): " custom_remap_tbs
-    remap_tablespace="${custom_remap_tbs:-USERS}"
+    read -p "Enter the full path to your .dmp file: " DUMP_FILE_PATH
+    DUMP_FILE_NAME=$(basename "$DUMP_FILE_PATH")
   else
     echo "Invalid choice! ❌"
     return 1
   fi
 
-  # Early file existence check
   if [[ ! -f "$DUMP_FILE_PATH" ]]; then
     echo "Error: Dump file '$DUMP_FILE_PATH' not found. ⚠️"
     ls -l *.dmp 2>/dev/null || echo "No .dmp files found in current directory."
     return 1
   fi
 
-  # Copy dump
   echo "Copying $DUMP_FILE_NAME into container volume..."
   docker cp "$DUMP_FILE_PATH" "$ORACLE_CONTAINER_NAME":"$CONTAINER_DP_DIR/$DUMP_FILE_NAME"
   if [ $? -ne 0 ]; then
     echo "Error: Failed to copy dump file via docker cp. ❌"
+    docker ps -a | grep oracle_db
     return 1
   fi
 
@@ -390,14 +353,25 @@ import_oracle() {
     return 1
   fi
 
-  # Ensure container is running
   if ! docker ps --filter "name=^${ORACLE_CONTAINER_NAME}$" --format '{{.Names}}' | grep -q "^${ORACLE_CONTAINER_NAME}$"; then
-    echo "Error: Oracle container not running. Run run_oracle() first. ❌"
+    echo "Error: Oracle container not running. ❌"
     return 1
   fi
 
-  # === Execute impdp ===
-  echo "Executing Data Pump import (remapping from $remap_from + known variants)..."
+  echo "Executing Data Pump import (using SYSTEM + remap)..."
+
+  local remap_arg=""
+  if [[ "$import_choice" == "2" ]]; then  # Cuscal
+    remap_arg="REMAP_SCHEMA=LPORTAL_CUSCAL_73:LPORTAL \
+               REMAP_TABLESPACE=CUSCAL_DATA:USERS \
+               REMAP_TABLESPACE=TOKIOMARINE:USERS \
+               REMAP_TABLESPACE=USERS:USERS"
+  elif [[ "$import_choice" == "3" ]]; then  # Tokio Marine
+    remap_arg="REMAP_SCHEMA=ADMLIFRYEXT:LPORTAL \
+               REMAP_TABLESPACE=USERS:USERS"
+  fi
+
+  echo "Executing Data Pump import (using SYSTEM + targeted remap)..."
 
   local impdp_output
   impdp_output=$(docker exec -u oracle "$ORACLE_CONTAINER_NAME" bash -c "
@@ -406,11 +380,11 @@ import_oracle() {
       DIRECTORY=LPORTAL_IMPORT_DIR \
       DUMPFILE=$DUMP_FILE_NAME \
       NOLOGFILE=Y \
-      REMAP_SCHEMA=$remap_from:LPORTAL \
-      REMAP_SCHEMA=LPORTAL_CUSCAL_73:LPORTAL \
-      REMAP_TABLESPACE=$remap_tablespace:USERS \
+      $remap_arg \
       TABLE_EXISTS_ACTION=REPLACE \
       FULL=Y \
+      TRANSFORM=SEGMENT_ATTRIBUTES:N \
+      EXCLUDE=STATISTICS \
       METRICS=YES
   " 2>&1)
 
@@ -419,33 +393,60 @@ import_oracle() {
   echo "$impdp_output" > "impdp_console_${DUMP_FILE_NAME}.txt"
   echo "Console output saved to impdp_console_${DUMP_FILE_NAME}.txt"
 
-  # Show relevant summary
   echo "Import summary (last 50 lines + key phrases):"
-  tail -n 50 "impdp_console_${DUMP_FILE_NAME}.txt" | grep -i "error\|skip\|schema\|owner\|tablespace\|user\|create\|remap\|processing\|object\|metrics\|completed\|warning" || echo "No key phrases found in tail."
+  tail -n 50 "impdp_console_${DUMP_FILE_NAME}.txt" | grep -i "error\|skip\|schema\|owner\|tablespace\|user\|create\|processing\|object\|metrics\|completed\|warning" || echo "No key phrases found."
 
   if [ $impdp_exit_code -eq 0 ] || [ $impdp_exit_code -eq 5 ] || echo "$impdp_output" | grep -qi "successfully completed"; then
     echo "Database imported (completed with possible warnings)! 🎉"
+
+    # Quota fix
+    echo "Ensuring LPORTAL has unlimited quota..."
+    docker exec -u oracle "$ORACLE_CONTAINER_NAME" sqlplus "SYSTEM/$SYSTEM_PASSWORD@$ORACLE_PDB_NAME" <<EOF
+      ALTER USER LPORTAL QUOTA UNLIMITED ON USERS;
+      ALTER USER LPORTAL QUOTA UNLIMITED ON TOKIOMARINE;
+      EXIT;
+EOF
+
+    # ← Add the RELEASE_ fix here
+    if [[ "$import_choice" == "2" ]]; then  # Only for Cuscal
+    echo "Updating RELEASE_ SERVLETCONTEXTNAME to 'portal-impl'..."
+    docker exec -u oracle "$ORACLE_CONTAINER_NAME" sqlplus "SYSTEM/$SYSTEM_PASSWORD@$ORACLE_PDB_NAME" <<EOF
+      ALTER SESSION SET CONTAINER = $ORACLE_PDB_NAME;
+
+      UPDATE LPORTAL.RELEASE_
+      SET SERVLETCONTEXTNAME = 'portal-impl'
+      WHERE SERVLETCONTEXTNAME = 'portal';
+
+      COMMIT;
+
+      SELECT SERVLETCONTEXTNAME, BUILDNUMBER, VERIFIED
+      FROM LPORTAL.RELEASE_
+      WHERE SERVLETCONTEXTNAME = 'portal-impl';
+
+      EXIT;
+EOF
+    fi
+
+    # Schema check (your existing one)
+    echo "Quick schema verification (using SYSTEM)..."
+    docker exec "$ORACLE_CONTAINER_NAME" sqlplus "SYSTEM/$SYSTEM_PASSWORD@$ORACLE_PDB_NAME" <<CHECK
+      ALTER SESSION SET CONTAINER = $ORACLE_PDB_NAME;
+      SET PAGESIZE 999 FEEDBACK ON HEADING ON ECHO OFF
+
+      SELECT 'Total tables in LPORTAL: ' || COUNT(*) FROM LPORTAL.user_tables;
+      SELECT 'RELEASE_ exists in LPORTAL: ' || CASE WHEN EXISTS (SELECT 1 FROM LPORTAL.user_tables WHERE table_name = 'RELEASE_') THEN 'YES' ELSE 'NO' END FROM dual;
+      SELECT 'COMPANY exists in LPORTAL: ' || CASE WHEN EXISTS (SELECT 1 FROM LPORTAL.user_tables WHERE table_name = 'COMPANY') THEN 'YES' ELSE 'NO' END FROM dual;
+      SELECT 'RELEASE_ build number (if exists): ' || BUILDNUMBER FROM LPORTAL."RELEASE_" WHERE ROWNUM = 1;
+
+      EXIT;
+CHECK
   else
     echo "Import failed critically (exit code $impdp_exit_code). Console tail:"
     echo "$impdp_output" | tail -n 50
     return 1
   fi
 
-  # Post-import: ensure LPORTAL has unlimited quota on common tablespaces
-  echo "Ensuring LPORTAL has unlimited quota..."
-docker exec -u oracle "$ORACLE_CONTAINER_NAME" sqlplus "SYSTEM/$SYSTEM_PASSWORD@$ORACLE_PDB_NAME" <<EOF
-  ALTER USER LPORTAL QUOTA UNLIMITED ON USERS;
-  ALTER USER LPORTAL QUOTA UNLIMITED ON TOKIOMARINE;
-  EXIT;
-EOF
-
-  # Optional: try to copy any log file (even if NOLOGFILE=Y)
-  docker cp "$ORACLE_CONTAINER_NAME:$CONTAINER_DP_DIR/impdp*.log" . 2>/dev/null || true
-  if [[ -f "impdp*.log" ]]; then
-    echo "Log file copied (if it exists)."
-  fi
-
-  # Your alteration_sql block (if any)
+  # alteration_sql block (if any)
   if [ -n "$alteration_sql" ]; then
     echo "Running post-import table alteration..."
     docker exec -u oracle "$ORACLE_CONTAINER_NAME" bash -c "
@@ -602,8 +603,9 @@ import_postgresql() {
   echo "9. Other"
   read -p "Enter your choice: " import_choice
   
-  dump_file=""
-  alteration_sql=""
+  local dump_file=""
+  local alteration_sql=""
+  local apply_boolean_fixes=false
 
   case $import_choice in
     1)
@@ -611,7 +613,8 @@ import_postgresql() {
       ;;
     2)
       dump_file="24Q3_ChurchMutual_database_dump.sql"
-      alteration_sql="ALTER TABLE public.cpdefinition_x_20102 ALTER COLUMN cpdefinitionid SET NOT NULL;"
+      alteration_sql="ALTER TABLE public.cpdefinition_x_20102 ALTER COLUMN cpdefinitionid SET NOT NULL; $boolean_fixes"
+      apply_boolean_fixes=true
       ;;
     3)
       dump_file="25Q3_dpesp_dump_20251013.sql"
@@ -631,6 +634,7 @@ import_postgresql() {
     8)
       dump_file="25Q1_sapphire-postgres-20250415.sql"
       alteration_sql="ALTER TABLE public.cpdefinition_x_20097 ALTER COLUMN cpdefinitionid SET NOT NULL;"
+      apply_boolean_fixes=false
       ;;
     8)
       read -p "Enter the path to your PostgreSQL dump file: " dump_file
@@ -641,31 +645,67 @@ import_postgresql() {
       ;;
   esac
 
-  if [ -f "$dump_file" ]; then
-    echo "Importing PostgreSQL database from **$dump_file**..."
-    docker exec -i postgresql_db psql -q -U root -d lportal < "$dump_file"
+  # if [ -f "$dump_file" ]; then
+  #   echo "Importing PostgreSQL database from **$dump_file**..."
+  #   docker exec -i postgresql_db psql -q -U root -d lportal < "$dump_file"
+    
+  #   if [ $? -eq 0 ]; then
+  #     echo "Database imported successfully! 🎉"
+      
+  #     if [ -n "$alteration_sql" ]; then
+  #       echo "Running post-import table alteration..."
+  #       docker exec postgresql_db psql -U root -d lportal -c "$alteration_sql"
+        
+  #       if [ $? -eq 0 ]; then
+  #         echo "Table alteration completed successfully! ✅"
+  #       else
+  #         echo "Error: Table alteration failed!"
+  #       fi
+  #     fi
+      
+  #   else
+  #     echo "Error: Database import failed! ❌"
+  #     exit 1
+  #   fi
+  # else
+  #   echo "Error: Dump file **$dump_file** not found! ⚠️"
+  #   exit 1
+  # fi
+
+  if [[ -f "$dump_file" ]]; then
+    echo "Importing PostgreSQL database from $dump_file..."
+    # Optimization: Use -v ON_ERROR_STOP=1 to catch import errors early
+    docker exec -i postgresql_db psql -U root -d lportal -v ON_ERROR_STOP=1 < "$dump_file"
     
     if [ $? -eq 0 ]; then
       echo "Database imported successfully! 🎉"
       
-      if [ -n "$alteration_sql" ]; then
-        echo "Running post-import table alteration..."
-        docker exec postgresql_db psql -U root -d lportal -c "$alteration_sql"
+      if [[ -n "$alteration_sql" ]]; then
+        echo "Running post-import table alterations..."
+        # We wrap this in a string. psql handles multiple statements separated by ;
+        docker exec -i postgresql_db psql -U root -d lportal -c "$alteration_sql"
         
-        if [ $? -eq 0 ]; then
-          echo "Table alteration completed successfully! ✅"
-        else
-          echo "Error: Table alteration failed!"
-        fi
+        [[ $? -eq 0 ]] && echo "Table alteration successful! ✅" || echo "Alteration failed! ❌"
       fi
-      
     else
       echo "Error: Database import failed! ❌"
       exit 1
     fi
   else
-    echo "Error: Dump file **$dump_file** not found! ⚠️"
+    echo "Error: Dump file $dump_file not found! ⚠️"
     exit 1
+  fi
+
+  if [ "$apply_boolean_fixes" = true ]; then
+      echo "Applying global boolean type fixes..."
+      local boolean_sql="
+        ALTER TABLE public.company ALTER COLUMN system_ TYPE boolean USING (CASE WHEN system_ = 'Y' THEN true WHEN system_ = 'N' THEN false ELSE NULL END);
+        ALTER TABLE public.dlfilerank ALTER COLUMN active_ TYPE boolean USING (CASE WHEN active_ = 'Y' THEN true WHEN active_ = 'N' THEN false ELSE NULL END);
+        ALTER TABLE public.oauth2application 
+          ALTER COLUMN rememberdevice TYPE boolean USING (CASE WHEN rememberdevice = 'Y' THEN true WHEN rememberdevice = 'N' THEN false ELSE NULL END), 
+          ALTER COLUMN trustedapplication TYPE boolean USING (CASE WHEN trustedapplication = 'Y' THEN true WHEN trustedapplication = 'N' THEN false ELSE NULL END);
+      "
+      docker exec -i postgresql_db psql -U root -d lportal -c "$boolean_sql"
   fi
 }
 
@@ -1341,25 +1381,17 @@ setup_and_import_mysql() {
   local DOCKER_IMAGE="mysql:8.0"  # Default image
   local IS_DXP_CLOUD=false      # Flag for DXP Cloud path
 
+  trap cleanup EXIT SIGINT SIGTERM
+
   debug() { [ "$DEBUG" = "true" ] && echo "[DEBUG] $@" >&2; }
 
   echo 'Choose a database to import:'
-  echo '1) Actinver'
-  echo '2) APCOA'
-  echo '3) Argus'
-  echo '4) Bosch'
-  echo '5) CNO Bizlink'
-  echo '6) IPC'
-  echo '7) Metos'
-  echo '8) OPAP'
-  echo '9) TBG Internet'
-  echo '10) TBG Intranet'
-  echo '11) TUDelft'
-  echo '12) e5a2'  
-  echo '13) Other (custom path)'
-  echo '14) Liferay DXP Cloud'
-  echo '15) d4a3'
-  read -rp 'Enter your choice: ' CHOICE
+  echo '1) Actinver     6) IPC            11) TUDelft'
+  echo '2) APCOA        7) Metos          12) e5a2 (LXC)'
+  echo '3) Argus        8) OPAP           13) Custom Path'
+  echo '4) Bosch        9) TBG Internet   14) DXP Cloud (LPD)'
+  echo '5) CNO Bizlink 10) TBG Intranet   15) d4a3'
+  read -rp 'Enter choice: ' CHOICE
 
   alteration_sql=""
 
@@ -1377,8 +1409,9 @@ setup_and_import_mysql() {
     9) TARGET_DB="tbg_internet"; ZIP_FILE="25Q3_tbg_internet_dump.sql" ;;
     10) TARGET_DB="tbg_intranet"; ZIP_FILE="25Q3_tbg_intranet_dump.sql" ;;
     11) TARGET_DB="tudelft_db"; ZIP_FILE="24Q1_TUDelft_database_dump.sql" ;;
-    12) TARGET_DB="lportal"; ZIP_FILE="5ff380f7-ced4-4df3-bac0-6af9537f5c9d"
-      MODL_CODE=e5a2
+    12) TARGET_DB="lportal"
+        ZIP_FILE="lxce5a2-e5a2prd.gz"
+        MODL_CODE=e5a2
       ;;
     13) read -rp "Enter the path to your custom dump zip: " ZIP_FILE
        read -rp "Enter your target database name: " TARGET_DB ;;
@@ -1832,6 +1865,12 @@ setup_and_import_mysql() {
     echo "Skipping SQL import for choice 2 (apcoa)"
   fi
 
+  if [[ "$INPUT_FILE" == *.gz ]]; then
+    # Use your new smart_import logic just for this file type
+    smart_import "$INPUT_FILE" "$TARGET_DB"
+    import_result=$?
+  fi
+
   if [ -n "$alteration_sql" ]; then
         echo "Running post-setup table alterations on MySQL (${TARGET_DB})..."
 
@@ -1911,9 +1950,9 @@ setup_and_import_mysql() {
 
   echo "Unzipping '$TOMCAT_ARCHIVE'..."
   if [[ "$TOMCAT_ARCHIVE" == *.zip ]]; then
-    unzip -o "$TOMCAT_ARCHIVE" -d . || { echo "Error: Failed to unzip '$TOMCAT_ARCHIVE'." >&2; return 1; }
+    unzip -oq "$TOMCAT_ARCHIVE" -d . > /dev/null || { echo "Error: Failed to unzip '$TOMCAT_ARCHIVE'." >&2; return 1; }
   elif [[ "$TOMCAT_ARCHIVE" == *.tar.gz ]]; then
-    tar -xzf "$TOMCAT_ARCHIVE" -C . || { echo "Error: Failed to extract '$TOMCAT_ARCHIVE'." >&2; return 1; }
+    tar -xzf "$TOMCAT_ARCHIVE" -C . > /dev/null || { echo "Error: Failed to extract '$TOMCAT_ARCHIVE'." >&2; return 1; }
   else
     echo "Error: Unsupported archive format for '$TOMCAT_ARCHIVE'." >&2
     return 1
@@ -2392,14 +2431,140 @@ WHERE TABLE_SCHEMA='lportal'
 " > alter_all_tables.sql
 }
 
+ensure_db_exists() {
+  local db=$1
+  local pwd_arg=""
+  [[ -n "$MYSQL_ROOT_PASSWORD" ]] && pwd_arg="-p$MYSQL_ROOT_PASSWORD"
+  
+  debug "Checking/Creating database: $db"
+  docker exec -i "$MYSQL_CONTAINER_NAME" mysql -u root $pwd_arg -e "CREATE DATABASE IF NOT EXISTS \`$db\`;"
+}
+
+# Handles .sql, .gz, and .zip imports automatically
+smart_import() {
+  local file=$1
+  local db=$2
+  local pwd_arg=""
+  [[ -n "$MYSQL_ROOT_PASSWORD" ]] && pwd_arg="-p$MYSQL_ROOT_PASSWORD"
+
+  ensure_db_exists "$db"
+
+  local start_time=$(date +%s)
+  echo "🚀 Importing $file into $db..."
+
+  # Optimization flags
+  local mysql_opts="--force --max-allowed-packet=943718400 --init-command='SET SESSION UNIQUE_CHECKS=0; SET SESSION FOREIGN_KEY_CHECKS=0; SET SESSION SQL_LOG_BIN=0;'"
+
+  # Logic to provide pv with a size hint for the progress bar
+  if [[ "$file" == *.gz ]]; then
+    # pv reads the compressed file (gets size), zcat decompresses
+    pv "$file" | zcat | docker exec -i "$MYSQL_CONTAINER_NAME" mysql -u root $pwd_arg $mysql_opts "$db"
+  elif [[ "$file" == *.zip ]]; then
+    local size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file")
+    unzip -p "$file" | pv -s "$size" | docker exec -i "$MYSQL_CONTAINER_NAME" mysql -u root $pwd_arg $mysql_opts "$db"
+  else
+    pv "$file" | docker exec -i "$MYSQL_CONTAINER_NAME" mysql -u root $pwd_arg $mysql_opts "$db"
+  fi
+
+  local duration=$(( $(date +%s) - start_time ))
+  echo "✅ Import finished in $((duration / 60))m $((duration % 60))s"
+}
+
+cleanup() {
+  local exit_code=$?
+  # Only show message if we're actually cleaning something up
+  if [[ -f "/tmp/mysql.cnf" || -d "${temp_dir:-/dev/null}" ]]; then
+    echo -e "\n🧹 Cleaning up temporary files..."
+    rm -f /tmp/mysql.cnf
+    # Only remove temp_dir if it was actually defined and exists
+    [[ -n "$temp_dir" && -d "$temp_dir" ]] && rm -rf "$temp_dir"
+  fi
+  
+  # Ensure we exit with the original error code if there was one
+  exit $exit_code
+}
+
+upgrade_liferay_tomcat() {
+  # 1. Force Defaults if empty
+  local TARGET_DB="${1:-lportal}"
+  local MODL_CODE="${2:-e5a2}"
+  local LIFERAY_DIR="liferay-dxp"
+
+  # 2. Path Setup
+  local CURRENT_DIR=$(pwd)
+  local LIFERAY_HOME_ABS="$CURRENT_DIR/$LIFERAY_DIR"
+
+  echo "---------------------------------------------------"
+  echo "🚀 Upgrading: $TARGET_DB | Home: $LIFERAY_HOME_ABS"
+  echo "---------------------------------------------------"
+
+  # 3. Locate and Extract Bundle (Same as your existing logic)
+  local TOMCAT_ARCHIVE=$(find . -maxdepth 1 \( -name "liferay-dxp-tomcat-*" -o -name "liferay-fixed.zip" \) | head -n 1)
+  [[ -z "$TOMCAT_ARCHIVE" ]] && { echo "Error: Archive not found."; return 1; }
+
+  [[ -d "$LIFERAY_DIR" ]] && rm -rf "$LIFERAY_DIR"
+  echo "📦 Extracting $TOMCAT_ARCHIVE..."
+  if [[ "$TOMCAT_ARCHIVE" == *.zip ]]; then unzip -oq "$TOMCAT_ARCHIVE" -d .; else tar -xzf "$TOMCAT_ARCHIVE" -C .; fi
+
+  # 4. CONFIGURATION: Setting paths precisely
+  local upgrade_tool_dir="$LIFERAY_DIR/tools/portal-tools-db-upgrade-client"
+  
+  # Ensure the directory exists before writing
+  [[ ! -d "$upgrade_tool_dir" ]] && { echo "Error: Upgrade tool dir not found"; return 1; }
+
+  echo "👤 Ensuring 'dxpcloud' user exists in MySQL..."
+  docker exec -i mysql_db mysql -u root ${MYSQL_ROOT_PASSWORD:+-p$MYSQL_ROOT_PASSWORD} -e "CREATE USER IF NOT EXISTS 'dxpcloud'@'%' IDENTIFIED BY ''; GRANT ALL PRIVILEGES ON *.* TO 'dxpcloud'@'%' WITH GRANT OPTION; FLUSH PRIVILEGES;"
+
+  echo "📝 Writing Configuration Files to $upgrade_tool_dir..."
+
+  # File 1: portal-upgrade-ext.properties (The modern standard)
+  cat > "$upgrade_tool_dir/portal-upgrade-ext.properties" <<EOF
+jdbc.default.driverClassName=com.mysql.cj.jdbc.Driver
+jdbc.default.url=jdbc:mysql://localhost:3306/${TARGET_DB}?characterEncoding=UTF-8&dontTrackOpenResources=true&holdResultsOpenOverStatementClose=true&serverTimezone=GMT&useFastDateParsing=false&useUnicode=true
+jdbc.default.username=root
+jdbc.default.password=${MYSQL_ROOT_PASSWORD:-}
+liferay.home=${LIFERAY_HOME_ABS}
+company.default.web.id=admin-${MODL_CODE}.lxc.liferay.com
+database.partition.enabled=true
+upgrade.database.dl.storage.check.disabled=true
+EOF
+
+  # File 2: portal-upgrade-database.properties (Legacy support, just in case)
+  cp "$upgrade_tool_dir/portal-upgrade-ext.properties" "$upgrade_tool_dir/portal-upgrade-database.properties"
+
+  # File 3: app-server.properties (Tells Liferay where the Tomcat folder is)
+  cat > "$upgrade_tool_dir/app-server.properties" <<EOF
+dir=${LIFERAY_HOME_ABS}/tomcat
+extra.lib.dirs=bin
+global.lib.dir=lib
+portal.dir=webapps/ROOT
+server.detector.server.id=tomcat
+EOF
+
+  # 5. EXECUTION
+  read -rp "Run upgrade script now for $TARGET_DB? (y/n): " RUN_NOW
+  if [[ "$RUN_NOW" =~ ^[Yy]$ ]]; then
+    echo "🏃 Starting Upgrade Client..."
+    # We MUST be inside the tool directory for it to pick up the .properties files
+    cd "$upgrade_tool_dir" || return 1
+    
+    # Removed the -n flag. 
+    # If it still prompts, it means it's not finding portal-upgrade-ext.properties 
+    # in the local folder.
+    ./db_upgrade_client.sh -j "-Dfile.encoding=UTF-8 -Duser.timezone=GMT -Xmx4096m"
+    
+    cd - >/dev/null
+  fi
+}
+
 echo "Choose a database to set up and import:"
 echo "1. SQL Server"
 echo "2. MySQL (if apcoa or e5a2, import first)"
 echo "3. PostgreSQL"
 echo "4. Oracle"
 echo "5. Import apcoa dump"
-echo "6. Import e5a2 dump reusable"
-echo "7. Import e5a2 dump hardcoded"
+echo "6. e5a2 - import & upgrade"
+echo "7. e5a2 - just the upgrade"
 echo "8. Stop and drop mysql_db container"
 echo "9. Clean Oracle container (stop/rm oracle_db)"
 read -p "Enter your choice (1/2/3/4/5/6/7/8/9): " CHOICE
@@ -2426,13 +2591,26 @@ case $CHOICE in
     upgrade_oracle_with_local_tomcat
     ;;
   5)
-    import_mysql_dump "apcoa_db" "24Q2_APCOA_database_dump.sql"
+    TARGET_DB="apcoa_db"
+    INPUT_FILE="24Q2_APCOA_database_dump.sql"
+    smart_import "$INPUT_FILE" "$TARGET_DB"
     ;;
+  # 6)
+  #   import_mysql_dump "lportal" "5ff380f7-ced4-4df3-bac0-6af9537f5c9d"
+  #   ;;
   6)
-    import_mysql_dump "lportal" "5ff380f7-ced4-4df3-bac0-6af9537f5c9d"
+    TARGET_DB="lportal"
+    INPUT_FILE="lxce5a2-e5a2prd.gz"
+    MODL_CODE="e5a2"
+    
+    smart_import "$INPUT_FILE" "$TARGET_DB"
+    upgrade_liferay_tomcat "$TARGET_DB" "$MODL_CODE"
     ;;
-  7)
-    import_e5a2_dump "lportal" "5ff380f7-ced4-4df3-bac0-6af9537f5c9d"
+
+  7) # Just the Upgrade (For when you've already imported the 15.5GB)
+    read -rp "Which DB are we upgrading? (e.g. lportal): " TARGET_DB
+    read -rp "MODL Code? (e.g. e5a2): " MODL_CODE
+    upgrade_liferay_tomcat "$TARGET_DB" "$MODL_CODE"
     ;;
   8)
     stop_drop_mysql_db
