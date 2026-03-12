@@ -2,9 +2,12 @@
 #
 # Author: Brian Joyner Wulbern <brian.wulbern@liferay.com>
 # Platform: Linux/Unix
-# VERSION: 1.22.0
-# Add support for upgrading e5a2 (mysql)
+# VERSION: 1.23.0
+# Add support for upgrading Antel and Lee Health (PostgreSQL)
 # 
+
+MYSQL_CONTAINER_NAME="mysql_db"
+debug() { :; }
 
 export_mysql_dump() {
   local MYSQL_CONTAINER_NAME="mysql_db"
@@ -592,15 +595,17 @@ SQL
 
 import_postgresql() {
   echo "Choose a database to import:"
-  echo "1. Balearia --> 02-dump_20250924-2.sql"
-  echo "2. Church Mutual --> 24Q3_ChurchMutual_database_dump.sql"
-  echo "3. DPESP --> 25Q3_dpesp_dump_20251013.sql"
-  echo "4. Jessa --> 24Q4_Jessa_database_dump.sql"
-  echo "5. Otis --> 2025Q1_lportal-postgresql-2025.q1.14-08182025.sql"
-  echo "6. Ovam --> 24Q3_OVAM_database_dump.sql"
-  echo "7. RWTH Aachen University --> 25Q1_RWTH_database_dump.sql"
-  echo "8. Sapphire --> 25Q1_sapphire-postgres-20250415.sql"
-  echo "9. Other"
+  echo "1. Antel --> antel-database-dump.zip"
+  echo "2. Balearia --> 02-dump_20250924-2.sql"
+  echo "3. Church Mutual --> 24Q3_ChurchMutual_database_dump.sql"
+  echo "4. DPESP --> 25Q3_dpesp_dump_20251013.sql"
+  echo "5. Jessa --> 24Q4_Jessa_database_dump.sql"
+  echo "6. Lee Health --> lee_health_dump-2025-12-30.zip"
+  echo "7. Otis --> 2025Q1_lportal-postgresql-2025.q1.14-08182025.sql"
+  echo "8. Ovam --> 24Q3_OVAM_database_dump.sql"
+  echo "9. RWTH Aachen University --> 25Q1_RWTH_database_dump.sql"
+  echo "10. Sapphire --> 25Q1_sapphire-postgres-20250415.sql"
+  echo "11. Other"
   read -p "Enter your choice: " import_choice
   
   local dump_file=""
@@ -608,83 +613,45 @@ import_postgresql() {
   local apply_boolean_fixes=false
 
   case $import_choice in
-    1)
-      dump_file="02-dump_20250924-2.sql"
-      ;;
-    2)
+    1) dump_file="antel-database-dump.zip" ;;
+    2) dump_file="02-dump_20250924-2.sql" ;;
+    3) 
       dump_file="24Q3_ChurchMutual_database_dump.sql"
-      alteration_sql="ALTER TABLE public.cpdefinition_x_20102 ALTER COLUMN cpdefinitionid SET NOT NULL; $boolean_fixes"
+      alteration_sql="ALTER TABLE public.cpdefinition_x_20102 ALTER COLUMN cpdefinitionid SET NOT NULL;"
       apply_boolean_fixes=true
       ;;
-    3)
-      dump_file="25Q3_dpesp_dump_20251013.sql"
-      ;;
-    4)
-      dump_file="24Q4_Jessa_database_dump.sql"
-      ;;
-    5)
-      dump_file="2025Q1_lportal-postgresql-2025.q1.14-08182025.sql"
-      ;;
-    6)
-      dump_file="24Q3_OVAM_database_dump.sql"
-      ;;
-    7)
-      dump_file="25Q1_RWTH_database_dump.sql"
-      ;;
-    8)
+    4) dump_file="25Q3_dpesp_dump_20251013.sql" ;;
+    5) dump_file="24Q4_Jessa_database_dump.sql" ;;
+    6) dump_file="lee_health_dump-2025-12-30.zip"; TARGET_DB="lee_health_db"; MODL_CODE="lee-health" ;;
+    7) dump_file="2025Q1_lportal-postgresql-2025.q1.14-08182025.sql" ;;
+    8) dump_file="24Q3_OVAM_database_dump.sql" ;;
+    9) dump_file="25Q1_RWTH_database_dump.sql" ;;
+    10) 
       dump_file="25Q1_sapphire-postgres-20250415.sql"
       alteration_sql="ALTER TABLE public.cpdefinition_x_20097 ALTER COLUMN cpdefinitionid SET NOT NULL;"
-      apply_boolean_fixes=false
       ;;
-    8)
-      read -p "Enter the path to your PostgreSQL dump file: " dump_file
-      ;;
-    *)
-      echo "Invalid choice!"
-      exit 1
-      ;;
+    11) read -p "Enter the path to your PostgreSQL dump file: " dump_file ;;
+    *) echo "Invalid choice!"; exit 1 ;;
   esac
-
-  # if [ -f "$dump_file" ]; then
-  #   echo "Importing PostgreSQL database from **$dump_file**..."
-  #   docker exec -i postgresql_db psql -q -U root -d lportal < "$dump_file"
-    
-  #   if [ $? -eq 0 ]; then
-  #     echo "Database imported successfully! 🎉"
-      
-  #     if [ -n "$alteration_sql" ]; then
-  #       echo "Running post-import table alteration..."
-  #       docker exec postgresql_db psql -U root -d lportal -c "$alteration_sql"
-        
-  #       if [ $? -eq 0 ]; then
-  #         echo "Table alteration completed successfully! ✅"
-  #       else
-  #         echo "Error: Table alteration failed!"
-  #       fi
-  #     fi
-      
-  #   else
-  #     echo "Error: Database import failed! ❌"
-  #     exit 1
-  #   fi
-  # else
-  #   echo "Error: Dump file **$dump_file** not found! ⚠️"
-  #   exit 1
-  # fi
 
   if [[ -f "$dump_file" ]]; then
     echo "Importing PostgreSQL database from $dump_file..."
-    # Optimization: Use -v ON_ERROR_STOP=1 to catch import errors early
-    docker exec -i postgresql_db psql -U root -d lportal -v ON_ERROR_STOP=1 < "$dump_file"
+    
+    # 1. We use --set ON_ERROR_STOP=0 so the script doesn't die on 'Owner' errors.
+    # 2. We use < "$dump_file" to stream the entire file into the container.
+    # 3. We use --quiet to avoid thousands of 'ALTER TABLE' lines in the console.
+    docker exec -i postgresql_db psql -U root -d lportal --set ON_ERROR_STOP=0 --quiet < "$dump_file"
     
     if [ $? -eq 0 ]; then
-      echo "Database imported successfully! 🎉"
+      echo "Database import finished! 🎉"
+      
+      # Fix the search path: If the dump used a custom schema, Liferay needs to see it.
+      echo "Ensuring search_path is inclusive..."
+      docker exec -i postgresql_db psql -U root -d lportal -c "ALTER USER root SET search_path TO \"\$user\", public;"
       
       if [[ -n "$alteration_sql" ]]; then
         echo "Running post-import table alterations..."
-        # We wrap this in a string. psql handles multiple statements separated by ;
         docker exec -i postgresql_db psql -U root -d lportal -c "$alteration_sql"
-        
         [[ $? -eq 0 ]] && echo "Table alteration successful! ✅" || echo "Alteration failed! ❌"
       fi
     else
@@ -987,16 +954,24 @@ EOF
 
   if [ ${PIPESTATUS[0]} -eq 0 ]; then
     echo "Upgrade completed successfully! 🎉"
+    
+    # NEW: Copy the log to the parent directory so it survives a 'rm -rf'
+    cp "$upgrade_log" "../../upgrade_SUCCESS_$(date +%Y%m%d).log"
+    
     echo "Start Liferay: $LIFERAY_HOME_ABS/tomcat/bin/startup.sh"
-    echo "Log: $(pwd)/$upgrade_log"
+    echo "A backup of the log has been saved to the current directory."
+    
+    # Return to the original directory
+    cd - >/dev/null
+    
+    # Stop the script here so it doesn't move on to MySQL/other DBs
+    exit 0 
   else
     echo "Upgrade failed. Check $(pwd)/$upgrade_log for details. ❌"
     tail -n 50 "$upgrade_log"
+    cd - >/dev/null
     return 1
   fi
-
-  cd - >/dev/null
-  echo "Liferay DXP Tomcat setup and Oracle upgrade complete!"
 }
 
 run_postgresql() {
@@ -1009,7 +984,7 @@ run_postgresql() {
   docker run --name postgresql_db -d \
     -e POSTGRES_USER=root \
     -e POSTGRES_HOST_AUTH_METHOD=trust \
-    -e POSTGRES_DB=lportal \
+    -e POSTGRES_DB=postgres \
     -p 5433:5432 \
     --memory=8g \
     --cpus=2 \
@@ -1021,10 +996,11 @@ run_postgresql() {
     -c checkpoint_timeout=30min \
     -c wal_buffers=16MB \
     -c maintenance_work_mem=1GB
+
   if [ $? -eq 0 ]; then
-    echo "⏳Waiting for PostgreSQL to be ready...⏳"
-    until docker exec postgresql_db pg_isready -U root -h localhost; do
-      sleep 10
+    echo "⏳ Waiting for PostgreSQL to be ready... ⏳"
+    until docker exec postgresql_db pg_isready -U root -h localhost > /dev/null 2>&1; do
+      sleep 2
     done
     echo "PostgreSQL container started successfully!"
   else
@@ -1032,10 +1008,27 @@ run_postgresql() {
     exit 1
   fi
 
-  echo "Dropping and recreating lportal."
+  echo "Cleaning up and preparing roles..."
   docker exec -i postgresql_db psql -U root -d postgres -c "DROP DATABASE IF EXISTS lportal;"
   docker exec -i postgresql_db psql -U root -d postgres -c "CREATE DATABASE lportal;"
-  docker exec -i postgresql_db psql -U root -d postgres -c "CREATE ROLE liferay WITH LOGIN PASSWORD 'liferay';"
+
+  local common_roles=("liferay" "portal" "pgadmin" "db_user" "admin" "liferay_user")
+
+  for role in "${common_roles[@]}"; do
+    echo "Ensuring role '$role' exists..."
+    docker exec -i postgresql_db psql -U root -d postgres -c \
+      "DO \$\$ 
+       BEGIN 
+         IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '$role') THEN 
+           CREATE ROLE $role WITH LOGIN PASSWORD '$role' SUPERUSER; 
+         END IF; 
+       END \$\$;"
+  done
+
+  # 5. Optional: Set search path to ensure schemas created during import are visible
+  docker exec -i postgresql_db psql -U root -d lportal -c "ALTER USER root SET search_path TO \"\$user\", public;"
+
+  echo "Roles and Database initialized. Ready for import. ✅"
 }
 
 upgrade_postgresql_with_local_tomcat() {
@@ -1391,6 +1384,7 @@ setup_and_import_mysql() {
   echo '3) Argus        8) OPAP           13) Custom Path'
   echo '4) Bosch        9) TBG Internet   14) DXP Cloud (LPD)'
   echo '5) CNO Bizlink 10) TBG Intranet   15) d4a3'
+  echo '16) Lee Health'
   read -rp 'Enter choice: ' CHOICE
 
   alteration_sql=""
@@ -1426,6 +1420,7 @@ setup_and_import_mysql() {
       IS_DXP_CLOUD=true
       ;;
     15) TARGET_DB="lportal"; ZIP_FILE="dump-d4a3.sql" ;;
+    16) TARGET_DB="lee_health_db"; ZIP_FILE="lee_health_dump-2025-12-30.zip" ;;
     *)
       echo "Invalid MySQL choice." >&2
       return 1
@@ -1480,7 +1475,6 @@ setup_and_import_mysql() {
         --innodb_flush_log_at_trx_commit=0 \
         --innodb_io_capacity=4000 \
         --innodb_write_io_threads=8 \
-        --lower_case_table_names=1 \
         --max-allowed-packet=943718400 \
         --wait-timeout=6000 \
         --sync_binlog=0"
@@ -1501,7 +1495,6 @@ setup_and_import_mysql() {
         --innodb_flush_log_at_trx_commit=0 \
         --innodb_io_capacity=4000 \
         --innodb_write_io_threads=8 \
-        --lower_case_table_names=1 \
         --max-allowed-packet=943718400 \
         --wait-timeout=6000 \
         --sync_binlog=0"
@@ -2434,10 +2427,19 @@ WHERE TABLE_SCHEMA='lportal'
 ensure_db_exists() {
   local db=$1
   local pwd_arg=""
+  
+  # Ensure we have a container name; fallback to mysql_db if empty
+  local container="${MYSQL_CONTAINER_NAME:-mysql_db}"
+  
   [[ -n "$MYSQL_ROOT_PASSWORD" ]] && pwd_arg="-p$MYSQL_ROOT_PASSWORD"
   
   debug "Checking/Creating database: $db"
-  docker exec -i "$MYSQL_CONTAINER_NAME" mysql -u root $pwd_arg -e "CREATE DATABASE IF NOT EXISTS \`$db\`;"
+  
+  # Using a subshell or checking the exit code here is safer
+  if ! docker exec -i "$container" mysql -u root $pwd_arg -e "CREATE DATABASE IF NOT EXISTS \`$db\`;" 2>/dev/null; then
+    echo "❌ Error: Could not connect to Docker container '$container'. Is it running?"
+    return 1
+  fi
 }
 
 # Handles .sql, .gz, and .zip imports automatically
@@ -2447,23 +2449,27 @@ smart_import() {
   local pwd_arg=""
   [[ -n "$MYSQL_ROOT_PASSWORD" ]] && pwd_arg="-p$MYSQL_ROOT_PASSWORD"
 
+  # Fix 1: Ensure container name is set
+  local container="${MYSQL_CONTAINER_NAME:-mysql_db}"
+
   ensure_db_exists "$db"
 
   local start_time=$(date +%s)
   echo "🚀 Importing $file into $db..."
 
-  # Optimization flags
-  local mysql_opts="--force --max-allowed-packet=943718400 --init-command='SET SESSION UNIQUE_CHECKS=0; SET SESSION FOREIGN_KEY_CHECKS=0; SET SESSION SQL_LOG_BIN=0;'"
+  # Fix 2: Move the SESSION sets to a variable we prepend to the stream
+  # This avoids the quoting nightmare with 'docker exec'
+  local sql_init="SET SESSION UNIQUE_CHECKS=0; SET SESSION FOREIGN_KEY_CHECKS=0; SET SESSION SQL_LOG_BIN=0;"
+  local mysql_cmd="mysql -u root $pwd_arg --force --max-allowed-packet=943718400 $db"
 
-  # Logic to provide pv with a size hint for the progress bar
   if [[ "$file" == *.gz ]]; then
-    # pv reads the compressed file (gets size), zcat decompresses
-    pv "$file" | zcat | docker exec -i "$MYSQL_CONTAINER_NAME" mysql -u root $pwd_arg $mysql_opts "$db"
+    # We use { echo ...; zcat ...; } to combine the init SQL with the dump
+    { echo "$sql_init"; zcat "$file"; } | pv | docker exec -i "$container" sh -c "$mysql_cmd"
   elif [[ "$file" == *.zip ]]; then
     local size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file")
-    unzip -p "$file" | pv -s "$size" | docker exec -i "$MYSQL_CONTAINER_NAME" mysql -u root $pwd_arg $mysql_opts "$db"
+    { echo "$sql_init"; unzip -p "$file"; } | pv -s "$size" | docker exec -i "$container" sh -c "$mysql_cmd"
   else
-    pv "$file" | docker exec -i "$MYSQL_CONTAINER_NAME" mysql -u root $pwd_arg $mysql_opts "$db"
+    { echo "$sql_init"; cat "$file"; } | pv | docker exec -i "$container" sh -c "$mysql_cmd"
   fi
 
   local duration=$(( $(date +%s) - start_time ))
