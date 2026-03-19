@@ -2,7 +2,7 @@
 
 function check_copyright {
     copyright_text="""/**
- * SPDX-FileCopyrightText: (c) 2025 Liferay, Inc. https://liferay.com
+ * SPDX-FileCopyrightText: (c) 2026 Liferay, Inc. https://liferay.com
  * SPDX-License-Identifier: LGPL-2.1-or-later OR LicenseRef-Liferay-DXP-EULA-2.0.0-2023-06
  */"""
 
@@ -52,6 +52,21 @@ function check_logs_folder {
     fi
 }
 
+function check_lts_version {
+    input=${1}
+    if [[ "$input" == *"-lts" ]]
+    then
+        if [[ "${PWD##*/}" == *"-lts"* ]]
+        then
+            echo "PASSED: LTS version check folder has LTS name" >> ${1}validation.txt
+        else
+            echo "FAILED: LTS version missing from folder name" >> ${1}validation.txt
+        fi
+    else
+        echo "Check for LTS skip. Not an LTS version"
+    fi
+}
+
 function check_mysql_jar {
     if [ ! -f liferay-dxp/tomcat/lib/mysql.jar ]
     then
@@ -73,7 +88,7 @@ function check_osgi_state {
 function check_osgi_marketplace {
     if [[ "$(find liferay-dxp/osgi/marketplace -maxdepth 1 -printf %y)" == "dd" ]]
     then
-        if [[ "$(ls -A liferay-dxp/osgi/marketplace/override)" == "README.md" ]]
+        if [[ ("$(ls -A liferay-dxp/osgi/marketplace/override)" == "README.md") || ("$(ls -A liferay-dxp/osgi/marketplace/override)" == "README.markdown") ]]
         then
             echo "PASSED: osgi/marketplace/override is present with README.md" >> ${1}validation.txt
         else
@@ -139,11 +154,15 @@ function check_startup_log {
     current_month="$(date +%B)"
     current_year=", $(date +%Y))"
 
-    if (echo "${update}" | grep --quiet "release")
+    if (echo "${update}" | grep -i --quiet "q")
     then
-        update=$(echo "${1}" | sed "s/^release-//")
-        update=$(echo "${update}" | tr "a-z" "A-Z")
-        portal_assertion="Liferay Digital Experience Platform ${update} (${current_month}"
+        if echo "$update" | grep -iq "lts" && ! echo "$update" | grep -q "2024"
+        then
+            update="${update%-lts}"
+            portal_assertion="Liferay Digital Experience Platform ${update} LTS (${current_month}"
+        else
+            portal_assertion="Liferay Digital Experience Platform ${update} (${current_month}"
+        fi
     else
         portal_assertion="Liferay Digital Experience Platform 7.4.13 Update ${update} (${current_month}"
     fi
@@ -177,12 +196,20 @@ function get_release_url {
 function main {
     if [ $# -eq 0 ]
     then
-        echo "Please add release version to argument. (Example: 130, release-2025.Q3.3)"
+        echo "Please add release version to argument. (Example: 130, 2025.Q3.3, 2025.Q1.5-lts)"
         exit 1
     fi
 
+    if [[ "${1}" == *"Q1"* ]] && [[ "${1}" != "2024"* ]] && [[ "${1}" != *"-lts" ]]
+    then
+        echo "Update argument to include lts version for q1. (Example: 2026.Q1.1-lts)"
+        exit 1
+    fi
+
+
     get_branch_name
     get_release_url "${1}"
+    check_lts_version "${1}"
     check_liferay_home "${1}"
     check_githash_file "${1}"
     check_copyright "${1}"
