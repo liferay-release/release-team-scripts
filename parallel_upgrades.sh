@@ -2,10 +2,9 @@
 #
 # Author: Brian Joyner Wulbern <brian.wulbern@liferay.com>
 # Platform: Linux/Unix
-# VERSION: 2.0.1
-# Added directory distinction for upgrade process to work within folder named after db upgrade
-# Added port distinctions for HTTP, ES, and Gogo in order to run   running  upgrading e5a2 (mysql)
-# Added support for changing tab title during process for better visibility
+# VERSION: 2.1.0
+# Added support for Antel, Lee Health, and new CNO Bizlink dump (MySQL)
+# Added environment clearing step for Oracle
 # 
 
 CURRENT_IMPORT_NAME="None"
@@ -34,8 +33,8 @@ import_oracle() {
   local DUMP_FILE_NAME=""
   local DUMP_FILE_PATH=""
 
-  declare -A dump_names=( [1]="CNO Bizlink" [2]="Cuscal" [3]="Tokio Marine" )
-  declare -A dump_files=( [1]="cno_bizlink_dump.dmp" [2]="25Q1_cuscal_dump_upgraded_with_kt_changes.dmp" [3]="25Q3_tokio_marine_old.dmp" )
+  declare -A dump_names=( [1]="Cuscal" [2]="Tokio Marine" )
+  declare -A dump_files=( [1]="25Q1_cuscal_dump_upgraded_with_kt_changes.dmp" [2]="25Q3_tokio_marine_old.dmp" )
 
   echo "Choose a database to import (.dmp file):"
   for i in $(seq 1 ${#dump_files[@]}); do echo "$i. ${dump_names[$i]}"; done
@@ -62,13 +61,14 @@ import_oracle() {
   fi
 
   local remap_arg=""
-  if [[ "$import_choice" == "2" ]]; then  # Cuscal
+  if [[ "$import_choice" == "1" ]]; then  # Cuscal
     remap_arg="REMAP_SCHEMA=LPORTAL_CUSCAL_73:LPORTAL REMAP_TABLESPACE=CUSCAL_DATA:USERS REMAP_TABLESPACE=TOKIOMARINE:USERS REMAP_TABLESPACE=USERS:USERS"
-  elif [[ "$import_choice" == "3" ]]; then  # Tokio Marine
+  elif [[ "$import_choice" == "2" ]]; then  # Tokio Marine
     remap_arg="REMAP_SCHEMA=ADMLIFRYEXT:LPORTAL REMAP_TABLESPACE=USERS:USERS"
   fi
 
   echo "Copying $DUMP_FILE_NAME into container volume..."
+  set_tab_title "Copying: Oracle ($DUMP_FILE_NAME)"
   docker cp "$DUMP_FILE_PATH" "$ORACLE_CONTAINER_NAME":"$CONTAINER_DP_DIR/$DUMP_FILE_NAME"
 
   echo "Executing Data Pump import (using SYSTEM + targeted remap)..."
@@ -91,15 +91,32 @@ import_oracle() {
     
     # Conditional SQL block based on project
     local custom_surgery_sql=""
-    if [[ "$import_choice" == "2" ]]; then
+    if [[ "$import_choice" == "1" ]]; then
         custom_surgery_sql="
         ALTER SESSION SET CURRENT_SCHEMA = LPORTAL;
-        -- Fix Context
+        
+        -- 1. Fix Context
         UPDATE Release_ SET servletContextName = 'portal-impl' WHERE servletContextName = 'portal';
-        -- Fix missing Admin (Targeted Link)
+        
+        -- 2. Fix missing Admin (Targeted Link for Company 18131)
         INSERT INTO Users_Roles (companyId, userId, roleId)
         SELECT 18131, 18131, roleId FROM Role_ WHERE name = 'Administrator' AND companyId = 18131
         AND NOT EXISTS (SELECT 1 FROM Users_Roles WHERE userId = 18131 AND roleId = (SELECT roleId FROM Role_ WHERE name = 'Administrator' AND companyId = 18131));
+        
+        -- 3. Explicit Fix: Resurrect missing user 930698
+        MERGE INTO User_ u
+        USING (SELECT 930698 as userId FROM DUAL) src
+        ON (u.userId = src.userId)
+        WHEN NOT MATCHED THEN
+            INSERT (mvccVersion, uuid_, userId, companyId, createDate, modifiedDate, contactId, password_, passwordEncrypted, passwordReset, screenName, emailAddress, facebookId, greeting, firstName, middleName, lastName, jobTitle, loginDate, lastLoginDate, status) 
+            VALUES (0, 'dummy-930698', 930698, 10131, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 930698, 'dummy', 1, 0, 'dummy_930698', 'dummy930698@liferay.com', 0, 'Welcome', 'Dummy', '', 'User', '', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 0);
+
+        MERGE INTO Contact_ c
+        USING (SELECT 930698 as contactId FROM DUAL) src
+        ON (c.contactId = src.contactId)
+        WHEN NOT MATCHED THEN
+            INSERT (mvccVersion, contactId, companyId, userId, userName, createDate, modifiedDate, firstName, middleName, lastName, male, birthday)
+            VALUES (0, 930698, 10131, 930698, 'Dummy User', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 'Dummy', '', 'User', 1, CURRENT_TIMESTAMP);
         "
     fi
 
@@ -134,15 +151,32 @@ run_oracle() {
   local force_recreate_user=${FORCE_ORACLE_WIPE:-0}
   local start_container=1
 
-  if docker ps --filter "name=^${ORACLE_CONTAINER_NAME}$" --format '{{.Names}}' | grep -q "^${ORACLE_CONTAINER_NAME}$"; then
-    echo "Oracle container '$ORACLE_CONTAINER_NAME' is already running. Checking if database is ready..."
-    if docker logs "$ORACLE_CONTAINER_NAME" 2>/dev/null | grep -q "DATABASE IS READY TO USE!"; then
-      echo "Database is already initialized and ready! Skipping container startup. 🎉"
-      start_container=0
-      docker exec -u oracle "$ORACLE_CONTAINER_NAME" bash -c "source /home/oracle/.bashrc; echo \"ALTER PLUGGABLE DATABASE $ORACLE_PDB_NAME OPEN;\" | sqlplus -S / as sysdba" > /dev/null 2>&1
+  # --- NEW: Aggressive 12GB Limit Prevention ---
+  if docker ps -a --filter "name=^${ORACLE_CONTAINER_NAME}$" --format '{{.Names}}' | grep -q "^${ORACLE_CONTAINER_NAME}$"; then
+    echo "---------------------------------------------------"
+    echo "⚠️  EXISTING ORACLE CONTAINER DETECTED ⚠️"
+    echo "Oracle Free Edition has a strict 12GB disk limit. Since our"
+    echo "database dumps (Cuscal, Tokio, etc.) are massive, importing"
+    echo "into a used container will trigger an ORA-12954 storage error."
+    echo "---------------------------------------------------"
+    read -rp "Destroy the existing container and start fresh? (Y/n): " nuke_choice
+    
+    if [[ ! "$nuke_choice" =~ ^[Nn]$ ]]; then
+      echo "🧹 Nuking old container and volume to reclaim space..."
+      docker rm -f "$ORACLE_CONTAINER_NAME" 2>/dev/null || true
+      docker volume rm oracle-dpdump 2>/dev/null || true
+      start_container=1
     else
-      echo "Container running but database not ready. Restarting..."
-      docker rm -f "$ORACLE_CONTAINER_NAME"
+      echo "Proceeding with existing container. Checking if database is ready..."
+      if docker logs "$ORACLE_CONTAINER_NAME" 2>/dev/null | grep -q "DATABASE IS READY TO USE!"; then
+        echo "Database is already initialized and ready! Skipping container startup. 🎉"
+        start_container=0
+        docker exec -u oracle "$ORACLE_CONTAINER_NAME" bash -c "source /home/oracle/.bashrc; echo \"ALTER PLUGGABLE DATABASE $ORACLE_PDB_NAME OPEN;\" | sqlplus -S / as sysdba" > /dev/null 2>&1
+      else
+        echo "Container running but database not ready. Restarting..."
+        docker rm -f "$ORACLE_CONTAINER_NAME"
+        start_container=1
+      fi
     fi
   fi
 
@@ -196,6 +230,15 @@ run_oracle() {
     EXCEPTION
       WHEN OTHERS THEN
         IF SQLCODE != -01543 THEN RAISE; END IF;
+    END;
+    /
+    
+    -- Restore missing SERVICE_ACCOUNT Profile to prevent ORA-02380 during Data Pump
+    BEGIN
+      EXECUTE IMMEDIATE 'CREATE PROFILE SERVICE_ACCOUNT LIMIT PASSWORD_LIFE_TIME UNLIMITED';
+    EXCEPTION
+      WHEN OTHERS THEN
+        IF SQLCODE != -02379 THEN RAISE; END IF; -- Ignore if profile already exists
     END;
     /
   "
@@ -281,7 +324,7 @@ import_postgresql() {
     7) dump_file="25Q1_RWTH_database_dump.sql"; TARGET_DB="rwth_db"; MODL_CODE="rwth" ;;
     8) dump_file="25Q1_sapphire-postgres-20250415.sql"; TARGET_DB="sapphire_db"; MODL_CODE="sapphire"
        alteration_sql="ALTER TABLE public.cpdefinition_x_20097 ALTER COLUMN cpdefinitionid SET NOT NULL;" ;;
-    9) dump_file="lee_health_dump-2025-12-30.zip"; TARGET_DB="lee_health_db"; MODL_CODE="lee-health" ;;
+    9) dump_file="25Q1_lee_health_dump-2025-12-30.zip"; TARGET_DB="lee_health_db"; MODL_CODE="lee-health" ;;
     10) dump_file="antel-database-dump.zip"; TARGET_DB="antel_db"; MODL_CODE="antel" ;;
     11) read -p "Enter path to SQL/ZIP: " dump_file
         TARGET_DB="custom_pg_db"; MODL_CODE="custom-pg" ;;
@@ -300,6 +343,10 @@ import_postgresql() {
   docker exec -i postgresql_db psql -U root -d postgres -c "CREATE DATABASE $TARGET_DB;"
 
   echo "🚀 Streaming $dump_file into $TARGET_DB..."
+
+  if type set_tab_title &>/dev/null; then
+      set_tab_title "Copying: SQL ($TARGET_DB)"
+  fi
 
   # 1. Determine extraction command
   local ext_cmd="cat \"$dump_file\""
@@ -622,126 +669,6 @@ run_postgresql() {
   set_tab_title "Ready: PostgreSQL Menu"
 }
 
-upgrade_postgresql_with_local_tomcat() {
-  # 1. Grab the DB name from the import step, default to lportal if missing
-  local DB_NAME="${CURRENT_TARGET_DB:-lportal}"
-  
-  # Check if your main script passed the DB name as an argument instead ($1)
-  [[ -n "$1" ]] && DB_NAME="$1"
-
-  echo "Starting Tomcat setup for database: $DB_NAME..."
-
-  local TOMCAT_ARCHIVE_PATH TOMCAT_VERSION
-  local LIFERAY_DIR="liferay-dxp"
-  
-  while true; do
-    read -rp "Enter the path to your Tomcat bundle directory (or press Enter to search for a Liferay Tomcat archive in the current folder): " TOMCAT_ARCHIVE_PATH
-
-    if [[ -z "$TOMCAT_ARCHIVE_PATH" ]]; then
-      TOMCAT_ARCHIVE_PATH="./"
-      TOMCAT_ARCHIVE=$(find "$TOMCAT_ARCHIVE_PATH" -maxdepth 1 \( \
-        -name "liferay-dxp-tomcat-7.4.13-u*.zip" \
-        -o -name "liferay-dxp-tomcat-7.4.13-u*.tar.gz" \
-        -o -name "liferay-dxp-tomcat-2024.*.tar.gz" \
-        -o -name "liferay-dxp-tomcat-2024.*.zip" \
-        -o -name "liferay-dxp-tomcat-2025.*.tar.gz" \
-        -o -name "liferay-dxp-tomcat-2025.*.zip" \
-        -o -name "liferay-fixed.zip" \) -print | head -n 1)
-
-      if [[ -z "$TOMCAT_ARCHIVE" ]]; then
-        echo "No Liferay Tomcat archive found in the current directory." >&2
-        continue
-      fi
-      break
-    elif [[ -f "$TOMCAT_ARCHIVE_PATH" ]]; then
-      TOMCAT_ARCHIVE="$TOMCAT_ARCHIVE_PATH"
-      break
-    elif [[ -d "$TOMCAT_ARCHIVE_PATH" ]]; then
-      echo "Error: '$TOMCAT_ARCHIVE_PATH' is a directory. Please provide a Tomcat archive file." >&2
-      continue
-    else
-      echo "Invalid path. Please enter a valid Tomcat archive file or press Enter." >&2
-      continue
-    fi
-  done
-
-  # FIX: Correctly extract the version for the log
-  TOMCAT_VERSION=$(basename "$TOMCAT_ARCHIVE" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "Unknown")
-  echo "Using Tomcat archive: $TOMCAT_ARCHIVE (Version: $TOMCAT_VERSION)"
-
-  echo "Navigating to $(pwd)..."
-  cd "$(pwd)" || { echo "Error: Failed to navigate to current directory." >&2; return 1; }
-
-  # Clean up and Extract
-  if [[ -d "$LIFERAY_DIR" ]]; then
-    echo "Deleting existing '$LIFERAY_DIR' folder..."
-    rm -rf "$LIFERAY_DIR" || { echo "Error: Failed to delete '$LIFERAY_DIR'." >&2; return 1; }
-  fi
-
-  echo "Extracting Tomcat..."
-  if [[ "$TOMCAT_ARCHIVE" == *.zip ]]; then
-    unzip -q -o "$TOMCAT_ARCHIVE" -d . || { echo "Error: Failed to unzip '$TOMCAT_ARCHIVE'." >&2; return 1; }
-  elif [[ "$TOMCAT_ARCHIVE" == *.tar.gz ]]; then
-    tar -xzf "$TOMCAT_ARCHIVE" -C . || { echo "Error: Failed to extract '$TOMCAT_ARCHIVE'." >&2; return 1; }
-  fi
-
-  # Determine absolute path for the upgrade tool configs
-  LIFERAY_HOME_ABS=$(pwd)/$LIFERAY_DIR
-
-  # Configure portal-ext.properties WITH DYNAMIC DATABASE NAME
-  echo "Creating properties files linking to $DB_NAME..."
-  cd "$LIFERAY_DIR" || return 1
-  
-  cat > portal-ext.properties <<EOF
-jdbc.default.driverClassName=org.postgresql.Driver
-jdbc.default.url=jdbc:postgresql://localhost:5433/${DB_NAME}
-jdbc.default.username=root
-jdbc.default.password=
-upgrade.database.dl.storage.check.disabled=true
-upgrade.database.preupgrade.verify.enabled=true
-upgrade.database.preupgrade.data.cleanup.enabled=true
-EOF
-  cd ../
-
-  # Configure DB Upgrade Tool
-  DB_UPGRADE_DIR="$LIFERAY_DIR/tools/portal-tools-db-upgrade-client"
-  if [[ -d "$DB_UPGRADE_DIR" ]]; then
-    echo "Configuring upgrade tool in $DB_UPGRADE_DIR..."
-    cd "$DB_UPGRADE_DIR" || return 1
-
-    # Upgrade Tool Configs
-    cat > portal-upgrade-ext.properties <<EOF
-jdbc.default.driverClassName=org.postgresql.Driver
-jdbc.default.url=jdbc:postgresql://localhost:5433/${DB_NAME}
-jdbc.default.username=root
-jdbc.default.password=
-liferay.home=${LIFERAY_HOME_ABS}
-upgrade.database.dl.storage.check.disabled=true
-upgrade.database.preupgrade.verify.enabled=true
-upgrade.database.preupgrade.data.cleanup.enabled=true
-EOF
-
-    # App Server Configs (Needed for the tool to find Tomcat libs)
-    cat > app-server.properties <<EOF
-dir=${LIFERAY_HOME_ABS}/tomcat
-extra.lib.dirs=bin
-global.lib.dir=lib
-portal.dir=webapps/ROOT
-server.detector.server.id=tomcat
-EOF
-
-    echo "Running database upgrade script on $DB_NAME..."
-    set_tab_title "PG Upgrade: $DB_NAME"
-
-    ./db_upgrade_client.sh -j "-Dfile.encoding=UTF-8 -Duser.timezone=GMT -Xmx4096m"
-
-    set_tab_title "Done: $DB_NAME"
-  else
-    echo "Error: Database upgrade directory not found!"
-    return 1
-  fi
-}
-
 run_sqlserver() {
   echo "Checking SQL Server container status..."
 
@@ -788,166 +715,6 @@ run_sqlserver() {
   fi
 }
 
-upgrade_sqlserver_with_local_tomcat() {
-  local TOMCAT_DIR="$1"
-  local TOMCAT_ARCHIVE="$2"
-  local MSSQL_JDBC_JAR="mssql-jdbc-12.8.2.jre11.jar"
-  #local MSSQL_JDBC_JAR="mssql-jdbc-12.2.0.jre8.jar"
-
-  echo "Starting Tomcat setup..."
-
-  local TOMCAT_ARCHIVE_PATH TOMCAT_VERSION
-  local LIFERAY_DIR="liferay-dxp"
-  while true; do
-    read -rp "Enter the path to your Tomcat bundle directory (or press Enter to search for a Liferay Tomcat archive in the current folder): " TOMCAT_ARCHIVE_PATH
-
-    if [[ -z "$TOMCAT_ARCHIVE_PATH" ]]; then
-      TOMCAT_ARCHIVE_PATH="./"
-      TOMCAT_ARCHIVE=$(find "$TOMCAT_ARCHIVE_PATH" -maxdepth 1 \( \
-        -name "liferay-dxp-tomcat-7.4.13-u*.zip" \
-        -o -name "liferay-dxp-tomcat-7.4.13-u*.tar.gz" \
-        -o -name "liferay-dxp-tomcat-2024.*.tar.gz" \
-        -o -name "liferay-dxp-tomcat-2024.*.zip" \
-        -o -name "liferay-dxp-tomcat-2025.*.tar.gz" \
-        -o -name "liferay-dxp-tomcat-2025.*.zip" \
-        -o -name "liferay-fixed.zip" \) -print | head -n 1)
-
-      if [[ -z "$TOMCAT_ARCHIVE" ]]; then
-        echo "No Liferay Tomcat archive found in the current directory." >&2
-        continue
-      fi
-      break
-    elif [[ -f "$TOMCAT_ARCHIVE_PATH" ]]; then
-      TOMCAT_ARCHIVE="$TOMCAT_ARCHIVE_PATH"
-      break
-    elif [[ -d "$TOMCAT_ARCHIVE_PATH" ]]; then
-      echo "Error: '$TOMCAT_ARCHIVE_PATH' is a directory. Please provide a Tomcat archive file." >&2
-      continue
-    else
-      echo "Invalid path. Please enter a valid Tomcat archive file or press Enter." >&2
-      continue
-    fi
-  done
-
-  local TOMCAT_VERSION=$(basename "$TOMCAT_ARCHIVE" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
-  echo "Using Tomcat version: $TOMCAT_VERSION"
-
-  echo "Navigating to $(pwd)..."
-  cd "$(pwd)" || { echo "Error: Failed to navigate to current directory." >&2; return 1; }
-
-  if [[ -d "$LIFERAY_DIR" ]]; then
-    echo "Deleting existing '$LIFERAY_DIR' folder..."
-    rm -rf "$LIFERAY_DIR" || { echo "Error: Failed to delete '$LIFERAY_DIR'." >&2; return 1; }
-  fi
-
-  echo "Unzipping '$TOMCAT_ARCHIVE'..."
-  if [[ "$TOMCAT_ARCHIVE" == *.zip ]]; then
-    unzip -o "$TOMCAT_ARCHIVE" -d . || { echo "Error: Failed to unzip '$TOMCAT_ARCHIVE'." >&2; return 1; }
-  elif [[ "$TOMCAT_ARCHIVE" == *.tar.gz ]]; then
-    tar -xzf "$TOMCAT_ARCHIVE" -C . || { echo "Error: Failed to extract '$TOMCAT_ARCHIVE'." >&2; return 1; }
-  else
-    echo "Error: Unsupported archive format for '$TOMCAT_ARCHIVE'." >&2
-    return 1
-  fi
-  if [[ ! -d "$LIFERAY_DIR" ]]; then
-    echo "Error: Unzipped archive did not create '$LIFERAY_DIR' folder." >&2
-    return 1
-  fi
-
-  LIFERAY_HOME_ABS=$(pwd)/$LIFERAY_DIR
-  echo "LIFERAY_HOME_ABS set to: $LIFERAY_HOME_ABS"
-
-  echo "Using Tomcat version: $VERSION"
-  echo "Tomcat directory: $TOMCAT_DIR"
-
-  echo "Navigating to $LIFERAY_DIR and creating portal-ext.properties..."
-  cd "$LIFERAY_DIR" || { echo "Failed to enter $LIFERAY_DIR"; return 1; }
-
-  cat > portal-ext.properties <<EOF
-jdbc.default.driverClassName=com.microsoft.sqlserver.jdbc.SQLServerDriver
-jdbc.default.url=jdbc:sqlserver://localhost:1433;databaseName=lportal;trustServerCertificate=true;
-jdbc.default.username=sa
-jdbc.default.password=R00t@1234
-liferay.home=${LIFERAY_HOME_ABS}
-upgrade.database.dl.storage.check.disabled=true
-upgrade.database.preupgrade.verify.enabled=true
-upgrade.database.preupgrade.data.cleanup.enabled=true
-EOF
-
-  echo "portal-ext.properties created successfully in $LIFERAY_DIR."
-  cd ../
-
-  JDBC_DEST="$LIFERAY_DIR/tomcat/webapps/ROOT/WEB-INF/shielded-container-lib/"
-  if [[ -f "$MSSQL_JDBC_JAR" ]]; then
-      echo "Copying $MSSQL_JDBC_JAR to $JDBC_DEST"
-      mkdir -p "$JDBC_DEST"
-
-      rsync -av "$MSSQL_JDBC_JAR" "$JDBC_DEST"
-
-      if [[ -f "$JDBC_DEST/$MSSQL_JDBC_JAR" ]]; then
-          echo "JDBC driver copied successfully."
-      else
-          echo "Error: Failed to copy JDBC driver to $JDBC_DEST"
-          return 1
-      fi
-  else
-      echo "Warning: JDBC driver file $MSSQL_JDBC_JAR not found in the current directory."
-  fi
-
-  DB_UPGRADE_DIR="$LIFERAY_DIR/tools/portal-tools-db-upgrade-client"
-  if [[ -d "$DB_UPGRADE_DIR" ]]; then
-    echo "Navigating to $DB_UPGRADE_DIR and updating portal-upgrade-ext.properties..."
-    cd "$DB_UPGRADE_DIR" || { echo "Failed to enter $DB_UPGRADE_DIR"; return 1; }
-
-    cat > portal-upgrade-ext.properties <<EOF
-jdbc.default.driverClassName=com.microsoft.sqlserver.jdbc.SQLServerDriver
-jdbc.default.url=jdbc:sqlserver://localhost:1433;databaseName=lportal;trustServerCertificate=true;
-jdbc.default.username=sa
-jdbc.default.password=R00t@1234
-liferay.home=${LIFERAY_HOME_ABS}
-upgrade.database.dl.storage.check.disabled=true
-upgrade.database.preupgrade.verify.enabled=true
-upgrade.database.preupgrade.data.cleanup.enabled=true
-EOF
-
-    cat > portal-upgrade-database.properties <<EOF
-jdbc.default.driverClassName=com.microsoft.sqlserver.jdbc.SQLServerDriver
-jdbc.default.url=jdbc:sqlserver://localhost:1433;databaseName=lportal;trustServerCertificate=true;
-jdbc.default.username=sa
-jdbc.default.password=R00t@1234
-liferay.home=${LIFERAY_HOME_ABS}
-upgrade.database.dl.storage.check.disabled=true
-upgrade.database.preupgrade.verify.enabled=true
-upgrade.database.preupgrade.data.cleanup.enabled=true
-EOF
-
-    echo "portal-upgrade-ext.properties updated successfully."
-
-    echo "Creating app-server.properties..."
-    local upgrade_tool_dir="$LIFERAY_DIR/tools/portal-tools-db-upgrade-client"
-    local app_server_properties_file="app-server.properties"
-    cat > "$app_server_properties_file" <<EOF || { echo "Error: Failed to create '$app_server_properties_file'." >&2; return 2; }
-dir=${LIFERAY_HOME_ABS}/tomcat
-extra.lib.dirs=bin
-global.lib.dir=lib
-portal.dir=webapps/ROOT
-server.detector.server.id=tomcat
-EOF
-
-    echo "Running database upgrade script..."
-    set_tab_title "SQL Upgrade: $DB_NAME"
-
-    ./db_upgrade_client.sh -j "-Dfile.encoding=UTF-8 -Duser.timezone=GMT -Xmx4096m"
-
-    set_tab_title "Done: $DB_NAME"
-  else
-    echo "Error: Database upgrade directory $DB_UPGRADE_DIR not found."
-    return 1
-  fi
-
-  echo "Script execution completed with database: $DB_NAME"
-}
-
 setup_and_import_mysql() {
   local NETWORK_NAME="my_app_network"
   local MYSQL_CONTAINER_NAME="mysql_db"
@@ -972,7 +739,7 @@ setup_and_import_mysql() {
     2) TARGET_DB="apcoa_db";    ZIP_FILE="24Q2_APCOA_database_dump.sql";    MODL_CODE="apcoa" ;;
     3) TARGET_DB="argus_db";    ZIP_FILE="24Q2_Argus_database_dump.sql";    MODL_CODE="argus" ;;
     4) TARGET_DB="bosch_db";    ZIP_FILE="25Q2_bosch_dump.sql";             MODL_CODE="bosch" ;;
-    5) TARGET_DB="cno_bizlink_db"; ZIP_FILE="24Q1_CNOBizlink_database_dump.sql"; MODL_CODE="cno-bizlink" ;;
+    5) TARGET_DB="cno_bizlink_db"; ZIP_FILE="25Q1_cno-bspn-2025.qx.22012026.zip"; MODL_CODE="cno-bizlink" ;;
     6) TARGET_DB="ipc_db";      ZIP_FILE="25Q1_ipc_dump_2025-05-05-164823.zip"; MODL_CODE="ipc" ;;
     7) TARGET_DB="metos_db";    ZIP_FILE="24Q3_Metos_database_dump.zip";    MODL_CODE="metos"
        alteration_sql="DROP TABLE IF EXISTS ctscore; DROP TABLE IF EXISTS exportimportreportentry; DELETE FROM Configuration_ WHERE configurationId = 'com.liferay.portal.tika.internal.configuration.TikaConfiguration';" ;;
@@ -980,7 +747,7 @@ setup_and_import_mysql() {
     9) TARGET_DB="tbg_internet"; ZIP_FILE="25Q3_tbg_internet_dump.sql";     MODL_CODE="tbg-internet" ;;
     10) TARGET_DB="tbg_intranet"; ZIP_FILE="25Q3_tbg_intranet_dump.sql";    MODL_CODE="tbg-intranet" ;;
     11) TARGET_DB="tudelft_db";  ZIP_FILE="24Q1_TUDelft_database_dump.sql"; MODL_CODE="tudelft" ;;
-    12) TARGET_DB="lportal"      ZIP_FILE="lxce5a2-e5a2prd.gz"              MODL_CODE="e5a2" ;;
+    12) TARGET_DB="lportal"      ZIP_FILE="25Q4_lxce5a2-e5a2prd.gz"              MODL_CODE="e5a2" ;;
     13) read -rp "Custom dump path: " ZIP_FILE; read -rp "Target DB Name: " TARGET_DB; MODL_CODE="custom-project" ;;
     14) 
       TARGET_DB="lportal"
@@ -1032,9 +799,8 @@ setup_and_import_oracle() {
     # 3. Map the user's choice from import_oracle to the folder name
     local PROJECT_NAME="CUSTOM"
     case "$import_choice" in
-        1) PROJECT_NAME="CNO" ;;
-        2) PROJECT_NAME="CUSCAL" ;;
-        3) PROJECT_NAME="TOKIO" ;;
+        1) PROJECT_NAME="CUSCAL" ;;
+        2) PROJECT_NAME="TOKIO" ;;
     esac
 
     TARGET_DB="LPORTAL"
@@ -1042,15 +808,6 @@ setup_and_import_oracle() {
     
     # 4. Trigger the Tomcat upgrade
     upgrade_liferay_tomcat "$PROJECT_NAME" "$TARGET_DB" "$import_choice" "oracle"
-}
-
-ensure_db_exists() {
-  local db=$1
-  local pwd_arg=""
-  [[ -n "$MYSQL_ROOT_PASSWORD" ]] && pwd_arg="-p$MYSQL_ROOT_PASSWORD"
-  
-  debug "Checking/Creating database: $db"
-  docker exec -i "$MYSQL_CONTAINER_NAME" mysql -u root $pwd_arg -e "CREATE DATABASE IF NOT EXISTS \`$db\`;"
 }
 
 run_mysql_engine() {
@@ -1151,11 +908,6 @@ cleanup() {
   exit $exit_code
 }
 
-# Safety Net: If schema_name is N/A, fallback to folder_id
-  if [[ "$schema_name" == "N/A" ]]; then
-      schema_name="$folder_id"
-  fi
-
 upgrade_liferay_tomcat() {
   local folder_id=$1
   local schema_name=$2
@@ -1230,18 +982,32 @@ upgrade_liferay_tomcat() {
   echo "---------------------------------------------------"
 
   # Extraction
-  local TOMCAT_ARCHIVE=$(find . -maxdepth 1 \( -name "liferay-dxp-tomcat-*" -o -name "liferay-fixed.zip" \) | head -n 1)
+  # Added -type f to ensure we only grab files, not directories
+  local TOMCAT_ARCHIVE=$(find . -maxdepth 1 -type f \( -name "*liferay-dxp-tomcat-*" -o -name "*${MODL_CODE}*.tar*" -o -name "*${MODL_CODE}*.zip" -o -name "liferay-fixed.zip" \) | grep -Ei -v "dump|mysql|postgres|oracle|sql|backup" | head -n 1)
+  
+  # Safety check: Did we actually find a file?
+  if [[ -z "$TOMCAT_ARCHIVE" ]]; then
+      echo "❌ Error: Could not find a Liferay Tomcat archive (.tar, .tar.gz, or .zip) to extract."
+      return 1 
+  fi
+
   if [[ -d "$BUNDLE_DIR" ]]; then rm -rf "$BUNDLE_DIR"; fi
   
   echo "📦 Extracting $TOMCAT_ARCHIVE into $BUNDLE_DIR..."
   mkdir -p "$BUNDLE_DIR"
-  if [[ "$TOMCAT_ARCHIVE" == *.zip ]]; then unzip -oq "$TOMCAT_ARCHIVE" -d "$BUNDLE_DIR"
-  else tar -xzf "$TOMCAT_ARCHIVE" -C "$BUNDLE_DIR" --strip-components=1; fi
+  
+  # Changed tar -xzf to tar -xf to support both .tar and .tar.gz safely
+  if [[ "$TOMCAT_ARCHIVE" == *.zip ]]; then 
+      unzip -oq "$TOMCAT_ARCHIVE" -d "$BUNDLE_DIR"
+  else 
+      tar -xf "$TOMCAT_ARCHIVE" -C "$BUNDLE_DIR" --strip-components=1
+  fi
 
   mkdir -p "$BUNDLE_DIR/data/document_library"
   local SHIELDED_LIB="$BUNDLE_DIR/tomcat/webapps/ROOT/WEB-INF/shielded-container-lib"
+  
   if [[ -n "$JDBC_JAR_PREFIX" ]]; then
-      local FOUND_JAR=$(find . -maxdepth 1 -name "${JDBC_JAR_PREFIX}*.jar" | head -n 1)
+      local FOUND_JAR=$(find . -maxdepth 1 -type f -name "${JDBC_JAR_PREFIX}*.jar" | head -n 1)
       if [[ -f "$FOUND_JAR" ]]; then cp "$FOUND_JAR" "$SHIELDED_LIB/"; fi
   fi
 
@@ -1335,18 +1101,96 @@ EOF
   fi
 }
 
-stop_and_drop_container() {
-  local container_name="$1"
-  local display_name="$2"
+run_upgrade_only() {
+    echo ""
+    echo "--- Select Database Type for Upgrade ---"
+    echo "1. MySQL"
+    echo "2. PostgreSQL"
+    echo "3. SQL Server"
+    echo "4. Oracle"
+    echo "B. Back to Main Menu"
+    read -p "Enter DB type: " db_choice
 
-  echo "🛑 Stopping and dropping $display_name ($container_name)..."
-  if docker ps -a --format '{{.Names}}' | grep -Eq "^${container_name}$"; then
-      docker stop "$container_name" 2>/dev/null || true
-      docker rm "$container_name" 2>/dev/null || true
-      echo "✅ $display_name container cleaned."
-  else
-      echo "ℹ️ $display_name container not found."
-  fi
+    local db_type=""
+    case "$db_choice" in
+        1) db_type="mysql" ;;
+        2) db_type="postgres" ;; 
+        3) db_type="sqlserver" ;;
+        4) db_type="oracle" ;;
+        [Bb]*) return ;;
+        *) echo "❌ Invalid choice."; return ;;
+    esac
+
+    if [[ "$db_type" == "oracle" ]]; then
+        DB_TYPE="oracle"
+        FORCE_ORACLE_WIPE=0 run_oracle 
+        select_existing_oracle_db
+    else
+        # --- Dynamic Target DB Name Menu ---
+        echo ""
+        echo "--- Select Target DB Name ---"
+        
+        local found_dbs=()
+        
+        # 🐳 Query the respective Docker container for existing databases
+        if [[ "$db_type" == "mysql" ]] && docker ps | grep -q "mysql_db"; then
+            # Grab all DBs, ignoring system schemas
+            found_dbs=($(docker exec -i mysql_db mysql -uroot ${MYSQL_ROOT_PASSWORD:+-p$MYSQL_ROOT_PASSWORD} -sN -e "SHOW DATABASES;" 2>/dev/null | grep -Ev "^(information_schema|performance_schema|mysql|sys|dxpcloud)$"))
+        
+        elif [[ "$db_type" == "postgres" ]] && docker ps | grep -q "postgresql_db"; then
+            # Grab all non-template DBs, ignoring the default 'postgres' DB
+            found_dbs=($(docker exec -i postgresql_db psql -U root -d postgres -t -c "SELECT datname FROM pg_database WHERE datistemplate = false AND datname != 'postgres';" 2>/dev/null | xargs))
+        
+        elif [[ "$db_type" == "sqlserver" ]] && docker ps | grep -q "sqlserver_db"; then
+            # Grab all DBs, ignoring master, tempdb, etc. (Note: path to sqlcmd might be /opt/mssql-tools18/bin/sqlcmd depending on your image version)
+            found_dbs=($(docker exec -i sqlserver_db /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P 'R00t@1234' -h -1 -W -Q "SET NOCOUNT ON; SELECT name FROM sys.databases WHERE name NOT IN ('master', 'tempdb', 'model', 'msdb');" 2>/dev/null | tr -d '\r' | grep -v "^\s*$"))
+        fi
+
+        local db_idx=1
+        if [[ ${#found_dbs[@]} -gt 0 ]]; then
+            for db in "${found_dbs[@]}"; do
+                echo "$db_idx. $db"
+                ((db_idx++))
+            done
+        else
+            echo "⚠️  No imported databases found (or container is not running)."
+        fi
+        
+        echo "$db_idx. Custom (Enter manually)"
+        read -p "Enter choice: " db_name_choice
+        
+        if [[ "$db_name_choice" -eq "$db_idx" ]]; then
+            read -rp "Enter custom DB name: " TARGET_DB
+        elif [[ "$db_name_choice" -gt 0 && "$db_name_choice" -lt "$db_idx" ]]; then
+            TARGET_DB="${found_dbs[$((db_name_choice-1))]}"
+        else
+            echo "❌ Invalid choice."; return
+        fi
+
+        # Auto-guess the MODL code from the database name
+        # Strips "_db" from the end, and replaces underscores with hyphens
+        local guessed_modl="${TARGET_DB%_db}"
+        guessed_modl="${guessed_modl//_/-}"
+
+        # --- Smart MODL Code Menu ---
+        echo ""
+        echo "--- Select Project / MODL Code ---"
+        echo "1. e5a2 (LXC - Partitioned)"
+        echo "2. Auto-Detect: $guessed_modl"
+        echo "3. Custom (Enter manually)"
+        read -p "Enter choice: " modl_choice
+        
+        case "$modl_choice" in
+            1) MODL_CODE="e5a2" ;;
+            2) MODL_CODE="$guessed_modl" ;;
+            3) read -rp "Enter custom MODL Code: " MODL_CODE ;;
+            *) echo "❌ Invalid choice."; return ;;
+        esac
+        
+        echo ""
+        echo "Starting upgrade for $TARGET_DB ($db_type) with MODL $MODL_CODE..."
+        upgrade_liferay_tomcat "$MODL_CODE" "$TARGET_DB" "6" "$db_type"
+    fi
 }
 
 stop_drop_containers() {
@@ -1357,6 +1201,7 @@ stop_drop_containers() {
   echo "3. PostgreSQL  (postgresql_db)"
   echo "4. Oracle      (oracle_db)"
   echo "5. ALL of the above 💥"
+  echo "6. 🧹 Prune Docker System (Reclaim Hard Drive Space)"
   echo "Q. Cancel"
   echo "---------------------------------------------------"
   read -rp "Enter your choice: " drop_choice
@@ -1364,10 +1209,8 @@ stop_drop_containers() {
   # Helper function to keep the logic DRY (Don't Repeat Yourself)
   remove_container() {
     local container_name=$1
-    # Check if the container exists (running or stopped)
     if docker ps -aqf name="^${container_name}$" > /dev/null; then
       echo "🛑 Stopping and removing container: $container_name..."
-      # -f forces removal even if it's currently running
       docker rm -f "$container_name" > /dev/null
       echo "✅ $container_name destroyed."
     else
@@ -1387,6 +1230,11 @@ stop_drop_containers() {
        remove_container "postgresql_db"
        remove_container "oracle_db"
        ;;
+    6)
+       echo "🧹 Pruning unused Docker containers, networks, and volumes..."
+       docker system prune -a --volumes -f
+       echo "✅ Docker system cleaned."
+       ;;
     [Qq]*|"") 
        echo "Canceled." 
        ;;
@@ -1405,16 +1253,14 @@ while true; do
       echo "⚠️  WARNING: Low disk space ($FREE_SPACE GB remaining). Consider cleaning up old bundles."
   fi
 
+  echo ""
   echo "--- Liferay Upgrade Factory ---"
-  echo "1. SQL Server DBs"
-  echo "2. MySQL DBs"
-  echo "3. PostgreSQL DBs"
-  echo "4. Oracle DBs (Import New)"
-  echo "5. Quick Import: APCOA (MySQL)"
-  echo "6. Quick Setup: e5a2 (MySQL)"
-  echo "7. Quick Upgrade: Custom (MySQL)"
-  echo "8. Quick Upgrade: Existing Oracle Schema"
-  echo "9. 🗑️  Stop/Drop Database Containers..."
+  echo "1. Setup & Import: SQL Server"
+  echo "2. Setup & Import: MySQL"
+  echo "3. Setup & Import: PostgreSQL"
+  echo "4. Setup & Import: Oracle"
+  echo "5. 🚀 Upgrade Existing Imported Database..."
+  echo "6. 🗑️  Stop/Drop Database Containers..."
   echo "Q. Quit"
   read -p "Enter choice: " CHOICE
 
@@ -1423,24 +1269,17 @@ while true; do
     2) setup_and_import_mysql ;;
     3) run_postgresql; import_postgresql; upgrade_liferay_tomcat "$MODL_CODE" "$TARGET_DB" "$import_choice" "postgres" ;;
     4) setup_and_import_oracle ;;
-    5) TARGET_DB="apcoa_db"; CURRENT_IMPORT_NAME="24Q2_APCOA_database_dump.sql"; smart_import "$CURRENT_IMPORT_NAME" "$TARGET_DB"; upgrade_liferay_tomcat "apcoa" "$TARGET_DB" "5" "mysql" ;;
-    6) TARGET_DB="lportal"; MODL_CODE="e5a2"; upgrade_liferay_tomcat "$MODL_CODE" "$TARGET_DB" "6" "mysql" ;;
-    7) read -rp "Which DB? " TARGET_DB; read -rp "MODL Code? " MODL_CODE; upgrade_liferay_tomcat "$MODL_CODE" "$TARGET_DB" "7" "mysql" ;;
-    8) 
-       DB_TYPE="oracle"
-       FORCE_ORACLE_WIPE=0 run_oracle 
-       select_existing_oracle_db
-       ;;
-    9) stop_drop_containers ;;
+    5) run_upgrade_only ;;
+    6) stop_drop_containers ;;
     [Qq]*) echo "Goodbye!"; exit 0 ;;
     *) echo "Invalid choice." ;;
   esac
 
-  if [[ "$CHOICE" =~ ^[1-8]$ ]]; then
+  if [[ "$CHOICE" =~ ^[1-5]$ ]]; then
       echo -e "\n---------------------------------------------------"
       echo "✅ ACTION COMPLETE"
-      echo "Target DB:     ${TARGET_DB:-N/A}"
-      echo "Liferay Home:  ${LIFERAY_HOME_ABS:-Not Setup}"
+      echo "Target DB:    ${TARGET_DB:-N/A}"
+      echo "Liferay Home: ${LIFERAY_HOME_ABS:-Not Setup}"
       echo "---------------------------------------------------"
   fi
 done
